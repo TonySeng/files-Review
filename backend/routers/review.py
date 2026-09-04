@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import time
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -101,7 +102,10 @@ def _resolve_legal_rules(
     if missing:
         raise HTTPException(
             status_code=400,
-            detail=f"法规临时规则集不可用（不存在、无权限或尚未生成完成）：{', '.join(missing)}",
+            detail=(
+                f"法规临时规则集不可用（不存在、无权限或尚未生成完成）：{', '.join(missing)}。"
+                "若仍在解析中，请改用「创建审核任务」（后台任务会在解析完成后自动开始审核）。"
+            ),
         )
     return rules
 
@@ -499,6 +503,224 @@ async def _drive_task(tid: str, req: ReviewRequest) -> None:
         store.mark_inactive(tid)
 
 
+# --------------------- 法规解析 → 审核自动串行（后台链） ---------------------
+
+_LEGAL_POLL_INTERVAL = 2.0  # 法规解析进度镜像轮询间隔（秒）
+_LEGAL_WAIT_MAX = 3600  # 等待法规解析的总上限（秒），防极端挂死
+
+
+def _mining_legal_ids(ruleset_ids: list[str], user_id: str | None) -> list[str]:
+    """筛选出「尚未解析完成」的法规临时规则集 id。"""
+    out: list[str] = []
+    for rid in ruleset_ids or []:
+        rec = legal_rules.get_set(rid, user_id)
+        if rec and rec.get("status") in ("pending", "mining"):
+            out.append(rid)
+    return out
+
+
+async def _fail_waiting_task(tid: str, message: str) -> None:
+    """把等待法规解析的审核任务标记为失败（已处终态则忽略）。"""
+    task = await store.get(tid)
+    if not task or task_store.TaskStore.is_terminal(task.get("status", "")):
+        return
+    await store.append_log(tid, message, "error")
+    await store.update(tid, status="failed", error=message, finished_at=time.time())
+    store.mark_inactive(tid)
+
+
+async def _wait_legal_then_drive(tid: str, req: ReviewRequest, mining_ids: list[str], user_id: str | None) -> None:
+    """等待法规规则集解析完成后自动驱动审核任务。
+
+    等待期间把法规解析进度/日志镜像到审核任务上（进度条先展示解析进度，
+    解析完成后切回审核自身进度），实现「先解析、后审核」的连续体验。
+    """
+    import datetime
+
+    mirrored_logs = 0  # 已镜像到审核任务的法规日志条数（各规则集日志累计水位）
+    deadline = time.monotonic() + _LEGAL_WAIT_MAX
+    try:
+        while True:
+            # 用户取消/系统已置终态则退出，不再驱动审核
+            task = await store.get(tid)
+            if not task or task_store.TaskStore.is_terminal(task.get("status", "")):
+                store.mark_inactive(tid)
+                return
+
+            recs = []
+            for rid in mining_ids:
+                rec = legal_rules.get_set(rid, user_id)
+                if not rec:
+                    await _fail_waiting_task(tid, f"法规规则集 {rid} 已不存在，审核无法继续")
+                    return
+                recs.append(rec)
+
+            statuses = [str(r.get("status")) for r in recs]
+            if "failed" in statuses:
+                bad = next(r for r in recs if str(r.get("status")) == "failed")
+                await _fail_waiting_task(
+                    tid,
+                    f"法规规则抽取失败，审核任务终止：《{bad.get('name')}》"
+                    f"{bad.get('error') or bad.get('progress_message') or ''}",
+                )
+                return
+            if all(s == "ready" for s in statuses):
+                break
+            if time.monotonic() > deadline:
+                await _fail_waiting_task(tid, "等待法规解析超时，审核任务终止")
+                return
+
+            # 镜像解析进度与增量日志（多规则集取进度最小者，保证不虚高）
+            slowest = min(recs, key=lambda r: float(r.get("progress") or 0))
+            logs = slowest.get("logs") or []
+            new_logs = logs[mirrored_logs:]
+            mirrored_logs = len(logs)
+            fields: dict[str, Any] = {
+                "progress": float(slowest.get("progress") or 0),
+                "progress_message": (
+                    f"法规解析中《{slowest.get('name')}》："
+                    f"{slowest.get('progress_message') or ''}"
+                ),
+            }
+            if new_logs:
+                task_logs = list(task.get("logs") or [])
+                for entry in new_logs:
+                    task_logs.append(
+                        {
+                            "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                            "text": f"[法规解析] {entry.get('text', '')}",
+                            "level": entry.get("level", "info"),
+                        }
+                    )
+                fields["logs"] = task_logs
+            await store.update(tid, **fields)
+            await asyncio.sleep(_LEGAL_POLL_INTERVAL)
+
+        # ---- 解析全部完成：回填规则元数据，交接给审核驱动 ----
+        docs = _resolve_docs(req)
+        rules = _resolve_rules(req, docs, user_id)
+
+        # 法规溯源说明此刻才注入（创建时规则集尚在解析，元数据不完整）
+        legal_note = _legal_instruction_note(req.legal_ruleset_ids or [], user_id)
+        if legal_note:
+            req.extra_instruction = (
+                (req.extra_instruction or "").strip() + "\n\n" + legal_note
+            ).strip()
+
+        # 历史结果回流：与普通任务创建路径一致（规则清单此时才可解析）
+        md5s = [d.get("md5") for d in docs if d.get("md5")]
+        rule_ids_eff = [str(r.get("id")) for r in rules if r.get("id")]
+        reflow = reviewdata_store.build_reflow_instruction(md5s, rule_ids_eff)
+        reflow_applied = False
+        if reflow:
+            logger.info("串行任务 %s 命中历史审核对应关系，注入回流约束(%d字)", tid, len(reflow))
+            req.extra_instruction = (
+                (req.extra_instruction or "").strip() + "\n\n" + reflow
+            ).strip()
+            reflow_applied = True
+
+        task = await store.get(tid)
+        meta = dict(task.get("request") or {}) if task else {}
+        meta.update(
+            {
+                "rule_count": len(rules),
+                "rule_ids": [str(r.get("id")) for r in rules if r.get("id")],
+                "rule_names": [str(r.get("name") or "") for r in rules if r.get("name")],
+                "legal_rule_meta": _legal_ruleset_meta(req.legal_ruleset_ids or [], user_id),
+                "extra_instruction": req.extra_instruction,
+            }
+        )
+        names = "、".join(str(r.get("name") or "") for r in recs)
+        await store.append_log(
+            tid,
+            f"法规解析完成（{names}）：共解析出 {len(rules)} 条规则，自动开始合规审核",
+            "ok",
+        )
+        await store.update(
+            tid,
+            rule_count=len(rules),
+            request=meta,
+            extra_instruction=req.extra_instruction,
+            reflow_applied=reflow_applied,
+            progress=0,
+            progress_message="法规解析完成，开始合规审核",
+        )
+        await _drive_task(tid, req)
+    except HTTPException as exc:
+        await _fail_waiting_task(tid, str(exc.detail))
+    except Exception as exc:  # noqa: BLE001 - 兜底，保证任务进入终态
+        logger.exception("法规解析串行链异常")
+        await _fail_waiting_task(tid, f"等待法规解析时异常：{exc}")
+
+
+def _spawn_chained_review(tid: str, req: ReviewRequest, mining_ids: list[str], user_id: str | None) -> None:
+    """注册并保活「解析→审核」串行链后台任务。"""
+    t = asyncio.create_task(_wait_legal_then_drive(tid, req, mining_ids, user_id))
+    _background.add(t)
+    t.add_done_callback(_background.discard)
+
+
+async def _create_chained_task(
+    req: ReviewRequest,
+    docs: list[dict],
+    mining_ids: list[str],
+    user_id: str | None,
+    caller: dict,
+) -> dict:
+    """创建「先解析后审核」的串行任务。
+
+    与普通任务的区别：法规规则尚未解析完成，规则清单/说明在解析完成后由
+    串行链回填；等待期间任务镜像法规解析进度与日志。
+    """
+    legal_only = (
+        req.legal_rules_only
+        if req.legal_rules_only is not None
+        else not _has_explicit_base(req)
+    )
+    # 法规规则此刻不可用：纯法规模式暂无规则；叠加模式先解析既有来源
+    rules = [] if legal_only else _resolve_base_rules(req, docs, user_id, allow_empty=True)
+    _resolved_rules = [r for r in rules if r.get("id")]
+
+    file_names = [d.get("filename", "") for d in docs]
+    tid = await store.create(
+        {
+            "file_ids": req.file_ids,
+            "mode": req.mode,
+            "ruleset_id": req.ruleset_id,
+            "rule_ids": [str(r.get("id")) for r in _resolved_rules],
+            "rule_names": [str(r.get("name") or "") for r in _resolved_rules],
+            "file_types": [d.get("file_type") or "" for d in docs],
+            "rule_group_ids": _effective_group_ids(req, docs),
+            "auto_match": req.auto_match,
+            "legal_ruleset_ids": list(req.legal_ruleset_ids or []),
+            "legal_rule_meta": _legal_ruleset_meta(req.legal_ruleset_ids or [], user_id),
+            "waiting_legal_rulesets": mining_ids,
+            "kb_enabled": req.kb_enabled,
+            "kb_id": _effective_kb_id(req),
+            "web_search_enabled": req.web_search_enabled,
+            "extra_instruction": req.extra_instruction,
+            "file_names": file_names,
+            "rule_count": len(rules),
+        },
+        user_id=user_id,
+    )
+    names = "、".join(
+        str((legal_rules.get_set(rid, user_id) or {}).get("name") or rid)
+        for rid in mining_ids
+    )
+    await store.update(
+        tid,
+        status="running",
+        progress_message=f"法规解析中（{names}），解析完成后自动开始审核",
+    )
+    store.mark_active(tid)
+    await store.append_log(tid, f"法规规则抽取进行中（{names}），解析完成后将自动开始审核", "info")
+    await store.append_log(tid, "解析进度将实时同步到本任务，无需手动干预", "info")
+    _spawn_chained_review(tid, req, mining_ids, user_id)
+    task = await store.get(tid)
+    return to_detail(task or {})
+
+
 # ----------------------------- SSE（保留兼容） -----------------------------
 @router.post("/stream", summary="SSE 实时审核：流式返回进度与结论事件")
 async def review_stream(req: ReviewRequest, caller: dict = Depends(deps.get_caller)):
@@ -550,10 +772,20 @@ async def review_stream(req: ReviewRequest, caller: dict = Depends(deps.get_call
 # ----------------------------- 后台异步任务 -----------------------------
 @router.post("/tasks", summary="创建异步审核任务")
 async def create_task(req: ReviewRequest, caller: dict = Depends(deps.get_caller)):
-    """提交一个后台审核任务，接口立即返回任务 ID，不阻塞。"""
+    """提交一个后台审核任务，接口立即返回任务 ID，不阻塞。
+
+    若引用的法规临时规则集仍在解析中，任务进入「串行等待」：先镜像解析进度，
+    解析完成后自动开始审核（无需用户重新操作）。
+    """
     docs = _resolve_docs(req)  # 校验文件存在与可审核内容
-    rules = _resolve_rules(req, docs, caller["user_id"])
     user_id = caller["user_id"]
+
+    # 法规规则集仍在抽取中 → 创建串行任务（先镜像解析进度，解析完自动审核）
+    mining_ids = _mining_legal_ids(req.legal_ruleset_ids or [], user_id)
+    if mining_ids:
+        return await _create_chained_task(req, docs, mining_ids, user_id, caller)
+
+    rules = _resolve_rules(req, docs, user_id)
     file_names = [d.get("filename", "") for d in docs]
     file_types_eff = [d.get("file_type") or "" for d in docs]
     rule_group_ids_eff = _effective_group_ids(req, docs)

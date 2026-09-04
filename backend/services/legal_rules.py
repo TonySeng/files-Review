@@ -110,7 +110,9 @@ def _persist_on_switch(_old_driver: str, _new_driver: str) -> None:
 storage.on_structured_switch(_persist_on_switch)
 
 _load()
-_recover_interrupted()
+# 注意：_recover_interrupted 内部会调用 _log（定义在下方），必须在 _log 之后执行；
+# 此前放在定义前，一旦重启时存在在途挖矿记录就会 NameError 崩溃循环。
+# （2026-09-04 修复：曾致容器 Restarting 循环）
 
 
 def _now() -> str:
@@ -147,6 +149,10 @@ def _log_rid(rid: str, text: str, level: str = "info") -> None:
             _log(rec, text, level)
             rec["updated_at"] = _now()
             _save()
+
+
+# 启动自愈：必须在 _log/_log_rid 定义之后调用（见上方注释）
+_recover_interrupted()
 
 
 def _chunk_progress(rec: dict[str, Any], total: int) -> float:
@@ -633,6 +639,66 @@ def _merge_basis(a: str | None, b: str | None) -> str:
 # --------------------------------------------------------------------------- #
 # 挖矿主流程
 # --------------------------------------------------------------------------- #
+def _meta_identity_keys(metas: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    """提取法规版本信息的「身份键」集合：(法规名称, 文号)，剔除双空项。"""
+    out: set[tuple[str, str]] = set()
+    for m in metas or []:
+        key = (
+            str(m.get("law_name") or "").strip(),
+            str(m.get("doc_number") or "").strip(),
+        )
+        if any(key):
+            out.add(key)
+    return out
+
+
+def _find_reusable_ruleset(
+    *,
+    source_files: list[dict[str, Any]],
+    source_meta: list[dict[str, Any]],
+    fingerprint: str,
+    user_id: str | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """查找可复用的已就绪解析结果（跳过重复解析）。
+
+    匹配优先级：
+    1. 来源文件+参数指纹完全一致（原有行为）；
+    2. 法规文件 MD5 集合与已有解析记录相同（参数变化也复用）；
+    3. 解析出的法规版本信息（法规名称+文号）已存在于既有记录。
+    返回 (规则集记录, 复用依据)；无可复用时 (None, "")。
+    """
+    with _lock:
+        candidates = [
+            json.loads(json.dumps(r))
+            for r in _items.values()
+            if r.get("status") == "ready" and _accessible(r, user_id)
+        ]
+
+    # 1) 精确指纹
+    for r in candidates:
+        if r.get("sources_fingerprint") == fingerprint:
+            return r, "来源文件与解析参数完全一致"
+
+    # 2) 文件 MD5 集合相同
+    new_md5 = {str(f.get("md5") or "") for f in source_files} - {""}
+    if new_md5:
+        for r in candidates:
+            old_md5 = {str(f.get("md5") or "") for f in r.get("source_files") or []} - {""}
+            if old_md5 and (old_md5 == new_md5 or new_md5 <= old_md5):
+                return r, "法规文件 MD5 与已有解析记录相同"
+
+    # 3) 法规版本信息已存在
+    new_keys = _meta_identity_keys(source_meta)
+    if new_keys:
+        for r in candidates:
+            old_keys = _meta_identity_keys(r.get("source_meta") or [])
+            hit = new_keys & old_keys
+            if hit:
+                law_name = next(iter(hit))[0]
+                return r, f"法规《{law_name}》的版本信息已存在解析结果"
+    return None, ""
+
+
 def _sources_fingerprint(source_files: list[dict[str, Any]], params: dict[str, Any]) -> str:
     payload = json.dumps(
         {
@@ -999,16 +1065,33 @@ async def create_ruleset(
     }
     fp = _sources_fingerprint(source_files, params)
 
-    # 相同来源 + 相同参数 → 复用已就绪的规则集，避免重复烧 token
+    # ---- 复用判定：命中已有解析结果 → 直接返回，跳过重复解析 ----
+    # 匹配优先级：来源+参数指纹 > 文件 MD5 集合 > 法规版本信息（法规名+文号）。
     if reuse:
-        with _lock:
-            for r in _items.values():
-                if (
-                    r.get("sources_fingerprint") == fp
-                    and r.get("status") == "ready"
-                    and _accessible(r, user_id)
-                ):
-                    return json.loads(json.dumps(r))
+        reused, reuse_reason = _find_reusable_ruleset(
+            source_files=source_files,
+            source_meta=source_meta,
+            fingerprint=fp,
+            user_id=user_id,
+        )
+        if reused:
+            # 在既有记录上留一条持久化复用痕迹（卡片日志面板可见）
+            _log_rid(
+                reused["id"],
+                f"新上传法规命中本解析结果（{reuse_reason}），直接复用，跳过重复解析",
+                "ok",
+            )
+            out = json.loads(json.dumps(reused))
+            out["reused"] = True
+            out["reuse_reason"] = reuse_reason
+            out["logs"] = [
+                {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "text": f"命中已有解析结果（{reuse_reason}），直接复用，跳过重复解析",
+                    "level": "ok",
+                }
+            ]
+            return out
 
     rid = f"lrs-{uuid.uuid4().hex[:12]}"
     rec: dict[str, Any] = {

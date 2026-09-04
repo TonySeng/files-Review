@@ -80,7 +80,7 @@ export default function TaskDetailPage({
   onRemove,
   onRefreshKnowledgeBases,
 }: Props) {
-  const { message } = AntdApp.useApp()
+  const { message, modal } = AntdApp.useApp()
   const [rerunOpen, setRerunOpen] = useState(false)
   // 滚动超过阈值时显示「返回顶部」悬浮按钮
   const [showBackTop, setShowBackTop] = useState(false)
@@ -332,7 +332,30 @@ export default function TaskDetailPage({
           </Button>
           {running ? (
             <Tooltip title="取消该审核任务">
-              <Button danger icon={<StopOutlined />} onClick={() => onCancel(task.task_id)}>
+              <Button
+                danger
+                icon={<StopOutlined />}
+                onClick={() => {
+                  const waitingLegal =
+                    (task.request?.waiting_legal_rulesets?.length ?? 0) > 0 ||
+                    (task.progress_message || '').startsWith('法规解析中')
+                  if (!waitingLegal) {
+                    onCancel(task.task_id)
+                    return
+                  }
+                  modal.confirm({
+                    title: '取消该审核任务？',
+                    content:
+                      '本审核任务正在等待法规解析完成。取消仅终止审核任务；' +
+                      '法规解析不受影响，将在后台继续完成并生成规则集，' +
+                      '生成的规则仍可在后续审核中使用。确定取消该审核任务吗？',
+                    okText: '取消审核任务',
+                    okButtonProps: { danger: true },
+                    cancelText: '暂不取消',
+                    onOk: () => onCancel(task.task_id),
+                  })
+                }}
+              >
                 取消
               </Button>
             </Tooltip>

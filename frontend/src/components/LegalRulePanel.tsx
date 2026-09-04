@@ -299,6 +299,15 @@ export default function LegalRulePanel({
               />
             )}
 
+            {detail.status === 'mining' && (
+              <Alert
+                type="info"
+                showIcon
+                message="解析进行中，可直接创建审核任务"
+                description="无需等待解析完成——现在就选择待审文件并创建审核任务，系统会自动在本任务中先完成法规解析（进度实时同步），随后自动开始合规审核。"
+              />
+            )}
+
             {showProgress && (
               <ProgressPanel
                 title="法规解析过程"
@@ -538,7 +547,7 @@ function LegalRulesTable({
 }
 
 // --------------------------------------------------------------------------- //
-// 新建法规规则集：上传 → 预检 → 生成（父组件轮询，与审核界面同一个过程面板）。
+// 新建法规规则集：上传后自动发起生成并关闭弹窗（进度由父组件轮询，展示在下方规则集卡片）。
 // --------------------------------------------------------------------------- //
 function CreateModal({
   open,
@@ -579,12 +588,26 @@ function CreateModal({
       ? 'running'
       : live.status
 
+  // 自动生成：上传完成后（多个文件上传间隙 800ms 静默即认为传完）自动发起
+  // 生成并关闭弹窗，进度改由下方规则集卡片实时展示，无需用户手动点「生成/后台运行」。
+  const filesRef = useRef<UploadedFile[]>([])
+  const pendingUploadCount = useRef(0)
+  const autoStartTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const autoStartedRef = useRef(false)
+
   const reset = () => {
     setFiles([])
     setUploading(false)
     setPreview(null)
     setName('')
     setError('')
+    filesRef.current = []
+    pendingUploadCount.current = 0
+    autoStartedRef.current = false
+    if (autoStartTimer.current) {
+      clearTimeout(autoStartTimer.current)
+      autoStartTimer.current = null
+    }
   }
 
   useEffect(() => {
@@ -602,13 +625,40 @@ function CreateModal({
     if (!fileList.length) return
     setUploading(true)
     setError('')
+    pendingUploadCount.current += fileList.length
     try {
       const { files: uploaded } = await api.uploadFiles(fileList, ['legal'])
-      setFiles(uploaded)
+      // 追加而非覆盖：多文件逐个触发 beforeUpload 时保留先上传的文件
+      setFiles((prev) => {
+        const seen = new Set(prev.map((f) => f.file_id))
+        const merged = [...prev, ...uploaded.filter((f) => !seen.has(f.file_id))]
+        filesRef.current = merged
+        return merged
+      })
     } catch (e) {
       setError((e as Error).message)
     } finally {
+      pendingUploadCount.current -= fileList.length
       setUploading(false)
+      scheduleAutoStart()
+    }
+  }
+
+  const scheduleAutoStart = () => {
+    if (pendingUploadCount.current > 0) return // 还有文件在传
+    if (autoStartTimer.current) clearTimeout(autoStartTimer.current)
+    autoStartTimer.current = setTimeout(() => void autoStart(), 800)
+  }
+
+  const autoStart = async () => {
+    if (autoStartedRef.current || !filesRef.current.length) return
+    autoStartedRef.current = true
+    const rec = await doGenerate()
+    if (rec) {
+      // 生成已发起：关闭弹窗，进度改由下方规则集卡片实时展示
+      onClose()
+    } else {
+      autoStartedRef.current = false // 失败保持弹窗打开，允许用户重试
     }
   }
 
@@ -634,18 +684,20 @@ function CreateModal({
     }
   }
 
-  const doGenerate = async () => {
-    if (!files.length) return
+  const doGenerate = async (): Promise<LegalRuleset | null> => {
+    if (!filesRef.current.length) return null
     setError('')
     try {
       const rec = await api.generateLegalRules({
-        file_ids: files.map((f) => f.file_id),
-        name: name.trim() || files[0]?.filename || '法规临时规则',
+        file_ids: filesRef.current.map((f) => f.file_id),
+        name: name.trim() || filesRef.current[0]?.filename || '法规临时规则',
         mode,
       })
       onStarted(rec) // 交给父组件轮询；弹窗可随时关闭，解析在后台继续
+      return rec
     } catch (e) {
       setError((e as Error).message)
+      return null
     }
   }
 
@@ -659,7 +711,7 @@ function CreateModal({
         phase === 'running'
           ? [
               <Button key="bg" onClick={onClose}>
-                后台运行
+                关闭窗口
               </Button>,
             ]
           : phase === 'ready'
@@ -734,7 +786,7 @@ function CreateModal({
             type="info"
             showIcon
             message="生成耗时提示"
-            description="法规规则由大模型逐块抽取，按当前模型响应速度每块约需 1–2 分钟，长法规整体生成可能需要数分钟。生成期间可在下方实时查看解析进度，也可点「后台运行」关闭本窗口。"
+            description="上传完成后将自动开始解析并关闭本窗口，解析进度在下方规则集卡片实时滚动展示；解析完成后创建审核任务会自动衔接，无需等待。"
           />
         )}
 

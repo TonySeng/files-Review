@@ -584,6 +584,8 @@ export interface AppConfig {
   deterministic_temperature: number
   data_snapshot_version: string
   use_current_time_as_basis: boolean
+  /** 法规解析默认抽取的规则条数上限（默认 30，可在服务配置调整） */
+  legal_max_rules?: number
 }
 
 export interface KnowledgeBase {
@@ -659,6 +661,8 @@ export interface ReviewTaskDetail extends ReviewTaskSummary {
     extra_instruction?: string
     legal_ruleset_ids?: string[] | null
     legal_rules_only?: boolean | null
+    /** 串行等待法规解析的规则集 id（解析完成后自动审核的任务才有） */
+    waiting_legal_rulesets?: string[] | null
   }
   logs: LogEntry[]
   findings: Finding[]

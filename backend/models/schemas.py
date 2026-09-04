@@ -278,9 +278,13 @@ class ConfigUpdate(BaseModel):
     llm_timeout: int | None = None
     llm_temperature: float | None = None
     llm_max_tokens: int | None = None
+    ocr_provider: str | None = None
     ocr_base_url: str | None = None
     ocr_path: str | None = None
     ocr_category: str | None = None
+    ocr_api_key: str | None = None
+    ocr_secret_key: str | None = None
+    ocr_token_path: str | None = None
     ocr_timeout: int | None = None
     kb_base_url: str | None = None
     kb_id: str | None = None
@@ -327,6 +331,8 @@ class ConnectionTestRequest(BaseModel):
     target: Literal["llm", "ocr", "kb", "web_search"]
     base_url: str | None = None
     api_key: str | None = None
+    secret_key: str | None = None  # 需要 AK/SK 双密钥的服务（如百度 OCR）
+    provider: str | None = None  # OCR 服务类型（tuling / baidu），先测后存时临时生效
 
 
 # --------------------------------------------------------------------------- #

@@ -30,6 +30,13 @@ interface Props {
 
 type TestState = Record<string, { ok: boolean; message: string } | 'loading' | undefined>
 
+// OCR 双方服务的默认地址/路径（切换服务类型时自动带出）
+const TULING_BASE = 'http://223.111.149.152:8090'
+const TULING_PATH = '/tuling/uocr/v2/recognize'
+const BAIDU_BASE = 'https://aip.baidubce.com'
+const BAIDU_PATH = '/rest/2.0/ocr/v1/general_basic'
+const BAIDU_TOKEN_PATH = '/oauth/2.0/token'
+
 export default function SettingsDrawer({ open, onClose, onSaved, role, currentUser }: Props) {
   const { message } = AntdApp.useApp()
   const isAdmin = role === 'admin'
@@ -41,6 +48,8 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
   const [configured, setConfigured] = useState<Record<string, boolean>>({})
   const [storage, setStorage] = useState<StorageStatus | null>(null)
   const [reloadingStorage, setReloadingStorage] = useState(false)
+  // 当前选中的 OCR 服务类型（响应式：切换后表单随之展示对应字段）
+  const ocrProv = (Form.useWatch('ocr_provider', form) as string | undefined) ?? 'tuling'
 
   useEffect(() => {
     if (!open || !isAdmin) return
@@ -49,7 +58,13 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
       .then(({ config }) => {
         // 密钥字段后端脱敏为 "***"；回显时清空并标记“已配置”，
         // 避免把掩码写入表单后测试/保存时当成真实密钥导致 401 或误清空。
-        const KEY_FIELDS = ['llm_api_key', 'web_search_api_key', 'kb_api_key'] as const
+        const KEY_FIELDS = [
+          'llm_api_key',
+          'web_search_api_key',
+          'kb_api_key',
+          'ocr_api_key',
+          'ocr_secret_key',
+        ] as const
         const echo = { ...config }
         const configuredState: Record<string, boolean> = {}
         for (const k of KEY_FIELDS) {
@@ -97,10 +112,16 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
       // 密钥为空（已配置但未改动）时传 undefined，由后端沿用已存密钥；
       // 绝不向下发送 "***" 掩码，否则会被当成真实密钥导致 401。
       const rawKey = keyField ? form.getFieldValue(keyField) : undefined
+      // 百度 OCR 等需要 AK/SK 双密钥的服务：一并下发 Secret Key 与未保存的服务类型，
+      // 支持「填完即测」，无需先保存
+      const rawSecret = target === 'ocr' ? form.getFieldValue('ocr_secret_key') : undefined
+      const rawProvider = target === 'ocr' ? form.getFieldValue('ocr_provider') : undefined
       const res = await api.testConnection(
         target,
         urlField ? form.getFieldValue(urlField) : undefined,
         rawKey && rawKey !== '***' ? rawKey : undefined,
+        rawSecret && rawSecret !== '***' ? rawSecret : undefined,
+        rawProvider || undefined,
       )
       setTests((prev) => ({ ...prev, [target]: { ok: res.ok, message: res.message } }))
       if (target === 'kb' && res.ok) {
@@ -121,7 +142,13 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
       const values = await form.validateFields()
       // 密钥字段：已配置但留空表示“保持不变”，剔除后再提交，避免覆盖/清空已存密钥
       const patch = { ...values } as Partial<AppConfig> & Record<string, unknown>
-      for (const k of ['llm_api_key', 'web_search_api_key', 'kb_api_key'] as const) {
+      for (const k of [
+        'llm_api_key',
+        'web_search_api_key',
+        'kb_api_key',
+        'ocr_api_key',
+        'ocr_secret_key',
+      ] as const) {
         if (!patch[k]) delete patch[k]
       }
       const { config } = await api.updateSettings(patch as Partial<AppConfig>)
@@ -272,6 +299,34 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
         <Divider orientation="left" plain>
           OCR 服务
         </Divider>
+        <Form.Item label="服务类型" name="ocr_provider">
+          <Select
+            options={[
+              { value: 'tuling', label: '图聆云（免鉴权，multipart 上传）' },
+              {
+                value: 'baidu',
+                label: '百度智能云 OCR（API Key + Secret Key 授权）',
+              },
+            ]}
+            onChange={(v: 'tuling' | 'baidu') => {
+              // 切换服务类型时，若地址/路径仍是另一方的默认值则自动带出对应默认值
+              const patch: Record<string, string> = {}
+              const curBase = form.getFieldValue('ocr_base_url')
+              const curPath = form.getFieldValue('ocr_path')
+              if (v === 'baidu') {
+                if (!curBase || curBase === TULING_BASE) patch.ocr_base_url = BAIDU_BASE
+                if (!curPath || curPath === TULING_PATH) patch.ocr_path = BAIDU_PATH
+                if (!form.getFieldValue('ocr_token_path')) {
+                  patch.ocr_token_path = BAIDU_TOKEN_PATH
+                }
+              } else {
+                if (!curBase || curBase === BAIDU_BASE) patch.ocr_base_url = TULING_BASE
+                if (!curPath || curPath === BAIDU_PATH) patch.ocr_path = TULING_PATH
+              }
+              if (Object.keys(patch).length) form.setFieldsValue(patch)
+            }}
+          />
+        </Form.Item>
         <Form.Item
           label={
             <Space>
@@ -288,16 +343,62 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
           }
           name="ocr_base_url"
         >
-          <Input placeholder="http://223.111.149.152:8090" />
+          <Input
+            placeholder={ocrProv === 'baidu' ? 'https://aip.baidubce.com' : 'http://223.111.149.152:8090'}
+          />
         </Form.Item>
         <Space size={10} style={{ width: '100%' }}>
           <Form.Item label="接口路径" name="ocr_path" style={{ flex: 1, minWidth: 200 }}>
-            <Input placeholder="/tuling/uocr/v2/recognize" />
+            <Input
+              placeholder={
+                ocrProv === 'baidu'
+                  ? '/rest/2.0/ocr/v1/general_basic（通用文字识别）'
+                  : '/tuling/uocr/v2/recognize'
+              }
+            />
           </Form.Item>
           <Form.Item label="超时(秒)" name="ocr_timeout">
             <InputNumber min={5} max={600} style={{ width: 100 }} />
           </Form.Item>
         </Space>
+
+        {ocrProv === 'baidu' ? (
+          <>
+            <Space size={10} style={{ width: '100%' }}>
+              <Form.Item
+                label="API Key"
+                name="ocr_api_key"
+                style={{ flex: 1, minWidth: 220 }}
+                extra={configured.ocr_api_key ? '已保存密钥，留空表示不修改' : undefined}
+              >
+                <Input.Password placeholder="百度智能云应用的 API Key" autoComplete="new-password" />
+              </Form.Item>
+              <Form.Item
+                label="Secret Key"
+                name="ocr_secret_key"
+                style={{ flex: 1, minWidth: 220 }}
+                extra={configured.ocr_secret_key ? '已保存密钥，留空表示不修改' : undefined}
+              >
+                <Input.Password
+                  placeholder="百度智能云应用的 Secret Key"
+                  autoComplete="new-password"
+                />
+              </Form.Item>
+            </Space>
+            <Form.Item label="Token 接口路径" name="ocr_token_path">
+              <Input placeholder="/oauth/2.0/token" />
+            </Form.Item>
+            <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: -8 }}>
+              百度智能云通用文字识别：用 API Key / Secret Key 换取 access_token（缓存至过期前 5
+              分钟自动刷新），图片以 base64 表单提交。免费额度与 QPS 限制以控制台为准；
+              高精度版可将接口路径改为 /rest/2.0/ocr/v1/accurate_basic。
+            </Typography.Paragraph>
+          </>
+        ) : (
+          <Form.Item label="识别类别" name="ocr_category" style={{ maxWidth: 320 }}>
+            <Input placeholder="atlas.doc" />
+          </Form.Item>
+        )}
 
         <Divider orientation="left" plain>
           知识库服务

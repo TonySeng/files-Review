@@ -641,10 +641,22 @@ export const api = {
     return request<{ config: AppConfig }>('/settings/reset', { method: 'POST' })
   },
 
-  testConnection(target: 'llm' | 'ocr' | 'kb' | 'web_search', baseUrl?: string, apiKey?: string) {
+  testConnection(
+    target: 'llm' | 'ocr' | 'kb' | 'web_search',
+    baseUrl?: string,
+    apiKey?: string,
+    secretKey?: string,
+    provider?: string,
+  ) {
     return request<{ ok: boolean; message: string; detail?: unknown }>('/settings/test', {
       method: 'POST',
-      body: JSON.stringify({ target, base_url: baseUrl, api_key: apiKey }),
+      body: JSON.stringify({
+        target,
+        base_url: baseUrl,
+        api_key: apiKey,
+        secret_key: secretKey,
+        provider,
+      }),
     })
   },
 

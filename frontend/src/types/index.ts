@@ -560,9 +560,13 @@ export interface AppConfig {
   llm_timeout: number
   llm_temperature: number
   llm_max_tokens: number
+  ocr_provider: string
   ocr_base_url: string
   ocr_path: string
   ocr_category: string
+  ocr_api_key: string
+  ocr_secret_key: string
+  ocr_token_path: string
   ocr_timeout: number
   kb_base_url: string
   kb_id: string

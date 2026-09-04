@@ -28,7 +28,13 @@ async def update_settings(
     patch = payload.model_dump(exclude_none=True)
     # 密钥字段：前端回显脱敏成 "***"，且“已配置则留空保持不变”。
     # 因此 None / 空串 / "***" 一律视为“不修改”，避免清空已存密钥。
-    for key in ("llm_api_key", "web_search_api_key", "kb_api_key"):
+    for key in (
+        "llm_api_key",
+        "web_search_api_key",
+        "kb_api_key",
+        "ocr_api_key",
+        "ocr_secret_key",
+    ):
         if patch.get(key) in (None, "", "***"):
             patch.pop(key, None)
     if patch:
@@ -68,6 +74,16 @@ async def test_connection(
     # 仅当传入“有效”（非空且非脱敏占位符）才临时覆盖，否则沿用已保存配置
     if req.base_url and req.base_url != MASKED and url_key:
         overrides[url_key] = req.base_url
+    # 百度 OCR 等 AK/SK 双密钥服务：secret_key 一并临时覆盖，便于“先测后存”
+    if (
+        req.target == "ocr"
+        and req.secret_key
+        and req.secret_key != MASKED
+    ):
+        overrides["ocr_secret_key"] = req.secret_key
+    # 服务类型切换后未保存即测试：临时生效，避免用旧 provider 跑出一个误导性结果
+    if req.target == "ocr" and req.provider:
+        overrides["ocr_provider"] = req.provider
     if req.api_key and req.api_key != MASKED and secret_key:
         overrides[secret_key] = req.api_key
     # 兼容旧前端：web_search 曾把 api key 放在 base_url 字段

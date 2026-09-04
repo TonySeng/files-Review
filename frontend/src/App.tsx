@@ -30,6 +30,7 @@ import {
   BookOutlined,
   RobotOutlined,
 } from '@ant-design/icons'
+import BackToTop from './components/BackToTop'
 import RuleManagementPage from './pages/RuleManagementPage'
 import FileTypeConfigPage from './pages/FileTypeConfigPage'
 import RuleGroupConfigPage from './pages/RuleGroupConfigPage'
@@ -691,6 +692,9 @@ export default function App() {
         role={authKind ?? undefined}
         currentUser={authUser ?? undefined}
       />
+
+      {/* 全局「回到顶部」：所有登录后页面统一表现 */}
+      <BackToTop />
         </>
       )}
       {/* 恢复会话期间不弹登录框，改为居中 loading，避免有效令牌下刷新闪一下登录弹窗 */}

@@ -174,7 +174,7 @@ export default function ApiKeyManagementPage({ currentUser, isAdmin, onBack, emb
 
   return (
     <div style={{ padding: 16 }}>
-      <Space style={{ marginBottom: 12 }} wrap>
+      <Space className="page-sticky-row" style={{ marginBottom: 12 }} wrap>
         {!embedded && <Button onClick={onBack}>返回</Button>}
         {isAdmin && (
           <Select

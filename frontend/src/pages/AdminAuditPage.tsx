@@ -228,7 +228,7 @@ export default function AdminAuditPage({ onBack }: Props) {
 
   return (
     <div style={{ padding: 16 }}>
-      <Space style={{ marginBottom: 12 }}>
+      <Space className="page-sticky-row" style={{ marginBottom: 12 }}>
         <Button onClick={onBack}>返回</Button>
         <Typography.Text strong>按用户筛选：</Typography.Text>
         {userFilter}

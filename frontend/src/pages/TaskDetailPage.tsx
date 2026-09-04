@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import {
   App as AntdApp,
   Alert,
@@ -20,12 +20,12 @@ import {
 import type { ColumnsType } from 'antd/es/table'
 import {
   ArrowLeftOutlined,
-  ArrowUpOutlined,
   DeleteOutlined,
   DownloadOutlined,
   RedoOutlined,
   StopOutlined,
 } from '@ant-design/icons'
+import BackToTop from '../components/BackToTop'
 import ProgressPanel from '../components/ProgressPanel'
 import ResultPanel from '../components/ResultPanel'
 import RuleSelection, { type RuleConfigMode } from '../components/RuleSelection'
@@ -82,14 +82,6 @@ export default function TaskDetailPage({
 }: Props) {
   const { message, modal } = AntdApp.useApp()
   const [rerunOpen, setRerunOpen] = useState(false)
-  // 滚动超过阈值时显示「返回顶部」悬浮按钮
-  const [showBackTop, setShowBackTop] = useState(false)
-  useEffect(() => {
-    const onScroll = () => setShowBackTop(window.scrollY > 320)
-    window.addEventListener('scroll', onScroll, { passive: true })
-    onScroll()
-    return () => window.removeEventListener('scroll', onScroll)
-  }, [])
 
   // 重跑编辑器初始值（来自任务原始请求）
   const [editRuleConfigMode, setEditRuleConfigMode] = useState<RuleConfigMode>('group')
@@ -471,17 +463,7 @@ export default function TaskDetailPage({
         />
       </Space>
 
-      {showBackTop && (
-        <Button
-          className="detail-backtop"
-          type="primary"
-          shape="circle"
-          size="large"
-          icon={<ArrowUpOutlined />}
-          aria-label="返回顶部"
-          onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
-        />
-      )}
+      <BackToTop />
 
       <Modal
         title="修改配置并重新运行"

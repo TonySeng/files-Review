@@ -15,6 +15,7 @@ import {
   Typography,
 } from 'antd'
 import {
+  ArrowLeftOutlined,
   DiffOutlined,
   ExperimentOutlined,
   ReloadOutlined,
@@ -180,18 +181,27 @@ export default function PromptManagementPage({ onBack }: Props) {
   ]
 
   return (
-    <div className="page-container">
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-        <Space>
-          <Button onClick={onBack}>返回工作台</Button>
-          <Typography.Title level={4} style={{ margin: 0 }}>
+    <div className="rm-page">
+      <div className="rm-topbar">
+        <button className="rm-back" type="button" onClick={onBack}>
+          <ArrowLeftOutlined />
+          返回工作台
+        </button>
+        <div className="rm-title-wrap">
+          <div className="rm-title">
+            <ExperimentOutlined className="rm-title-icon" />
             Prompt 管理
-          </Typography.Title>
-          <Typography.Text type="secondary">
+          </div>
+          <div className="rm-subtitle">
             集中管理系统全部 LLM 提示词：编辑即生效，支持版本回滚与发布前测试
-          </Typography.Text>
-        </Space>
-        <Button icon={<ReloadOutlined />} onClick={() => void loadList()} loading={loading}>
+          </div>
+        </div>
+        <Button
+          icon={<ReloadOutlined />}
+          onClick={() => void loadList()}
+          loading={loading}
+          style={{ marginLeft: 'auto' }}
+        >
           刷新
         </Button>
       </div>

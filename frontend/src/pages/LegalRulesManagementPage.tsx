@@ -18,9 +18,11 @@ import {
   Typography,
 } from 'antd'
 import {
+  ArrowLeftOutlined,
   DeleteOutlined,
   EditOutlined,
   PlusOutlined,
+  ReadOutlined,
   ReloadOutlined,
   RocketOutlined,
 } from '@ant-design/icons'
@@ -239,18 +241,22 @@ export default function LegalRulesManagementPage({ onBack }: Props) {
   ]
 
   return (
-    <div className="page-container">
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 8 }}>
-        <Space wrap>
-          <Button onClick={onBack}>返回工作台</Button>
-          <Typography.Title level={4} style={{ margin: 0 }}>
+    <div className="rm-page">
+      <div className="rm-topbar">
+        <button className="rm-back" type="button" onClick={onBack}>
+          <ArrowLeftOutlined />
+          返回工作台
+        </button>
+        <div className="rm-title-wrap">
+          <div className="rm-title">
+            <ReadOutlined className="rm-title-icon" />
             法规规则管理
-          </Typography.Title>
-          <Typography.Text type="secondary">
+          </div>
+          <div className="rm-subtitle">
             上传的法律法规文件与解析出的审核规则的统一管理：关联查看、编辑、启停、转正与删除
-          </Typography.Text>
-        </Space>
-        <Space wrap>
+          </div>
+        </div>
+        <Space wrap style={{ marginLeft: 'auto' }}>
           <Input.Search
             placeholder="搜索名称 / 法规名"
             allowClear

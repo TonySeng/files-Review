@@ -291,6 +291,11 @@ body {
   padding-bottom: 18px;
   margin-bottom: 18px;
   border-bottom: 1px solid var(--rm-border);
+  /* 吸顶：固定在全局 app-header（56px）之下，滚动时始终可见可操作 */
+  position: sticky;
+  top: 56px;
+  z-index: 90;
+  background: #f5f6f8;
 }
 
 .rm-back {
@@ -1139,6 +1144,22 @@ body {
   border-top: 1px solid #f0f0f0;
 }
 
+/* 首页摘要卡吸顶：滚动时标题/统计/新建按钮所在行保持可见 */
+.home-summary-card {
+  position: sticky;
+  top: 56px;
+  z-index: 90;
+}
+
+/* 行内顶栏吸顶（用户管理 / 审计日志 / API Key 等简单页头部行） */
+.page-sticky-row {
+  position: sticky;
+  top: 56px;
+  z-index: 90;
+  background: #f5f6f8;
+  padding: 8px 0;
+}
+
 /* ============ 任务详情页 ============ */
 .task-detail-page {
   padding: 20px 24px 40px;
@@ -1165,13 +1186,20 @@ body {
   flex: 1;
 }
 
-/* 详情页返回顶部悬浮按钮 */
-.detail-backtop {
+/* 全局「回到顶部」悬浮按钮（components/BackToTop.tsx） */
+.back-to-top {
   position: fixed;
   right: 28px;
   bottom: 32px;
   z-index: 300;
   box-shadow: 0 6px 16px rgba(20, 30, 60, 0.22);
+}
+
+@media (max-width: 768px) {
+  .back-to-top {
+    right: 16px;
+    bottom: 20px;
+  }
 }
 
 /* 响应式：窄屏下统计与操作换行 */

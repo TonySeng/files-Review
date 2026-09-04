@@ -220,7 +220,7 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
     >
       <Form form={form} layout="vertical" size="small">
         <Divider orientation="left" plain style={{ marginTop: 0 }}>
-          大模型（千问 80B）
+          大模型
         </Divider>
         <Form.Item
           label={

@@ -391,7 +391,7 @@ export default function HistoricalDataPage({
             </div>
           </div>
         </Space>
-        <Tag color="cyan" icon={<SafetyOutlined />} style={{ fontSize: 13, padding: '4px 10px' }}>
+        <Tag color="cyan" icon={<SafetyOutlined />} style={{ fontSize: 13, padding: '4px 10px', marginLeft: 'auto' }}>
           确定性引擎运行中
         </Tag>
       </div>

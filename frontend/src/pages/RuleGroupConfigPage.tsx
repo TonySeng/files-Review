@@ -163,14 +163,15 @@ export default function RuleGroupConfigPage({ ruleSets, onBack, onChanged }: Pro
   return (
     <div className="rm-page">
       <div className="rm-topbar">
-        <Button icon={<ArrowLeftOutlined />} onClick={onBack} style={{ borderRadius: 999 }}>
+        <button className="rm-back" type="button" onClick={onBack}>
+          <ArrowLeftOutlined />
           返回工作台
-        </Button>
-        <div>
+        </button>
+        <div className="rm-title-wrap">
           <div className="rm-title">
-            <span className="i">🧩</span>审核规则组
+            <span className="rm-title-icon">🧩</span>审核规则组
           </div>
-          <div className="rm-sub">
+          <div className="rm-subtitle">
             规则组是规则的命名组合，可多选套用到任务；在此管理每组包含的具体规则。
           </div>
         </div>

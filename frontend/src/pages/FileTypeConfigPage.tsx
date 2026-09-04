@@ -156,14 +156,15 @@ export default function FileTypeConfigPage({ ruleGroups, onBack, onChanged }: Pr
   return (
     <div className="rm-page">
       <div className="rm-topbar">
-        <Button icon={<ArrowLeftOutlined />} onClick={onBack} style={{ borderRadius: 999 }}>
+        <button className="rm-back" type="button" onClick={onBack}>
+          <ArrowLeftOutlined />
           返回工作台
-        </Button>
-        <div>
+        </button>
+        <div className="rm-title-wrap">
           <div className="rm-title">
-            <span className="i">🗂</span>文件类型配置
+            <span className="rm-title-icon">🗂</span>文件类型配置
           </div>
-          <div className="rm-sub">
+          <div className="rm-subtitle">
             定义可审核的文件类型，并关联审核规则组（用于自动匹配）；系统不自动识别文件内容。
           </div>
         </div>

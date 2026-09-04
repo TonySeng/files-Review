@@ -123,6 +123,88 @@ async def locate_snippet(
     return {"snippet": snippet, "matches": matches}
 
 
+@router.get("/{file_id}/preview", summary="原文分页预览：返回指定页文本与高亮区间")
+async def preview_page(
+    file_id: str,
+    page: int | None = None,
+    start: int | None = None,
+    end: int | None = None,
+    snippet: str | None = None,
+    caller: dict = Depends(deps.get_caller),
+):
+    """原文预览 + 页码跳转 + 内容高亮（与原文定位共用同一份提取文本，保证对齐）。
+
+    定位方式（按优先级）：
+    - `start`（配合可选 `end`）：原文定位返回的绝对字符下标，自动换算所在页并
+      计算页内高亮区间；
+    - `page`：直接跳转到指定页（PDF 页码与定位描述中的「第N页」一致）；
+    - 两者都提供 `snippet` 时，在该页内二次定位（处理模糊匹配跨页边界的情况）。
+
+    无页标记的文档（docx/txt/xlsx）视为单页「全文」。
+    """
+    record = file_store.get(file_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    text = record.get("text") or ""
+    if not text.strip():
+        raise HTTPException(status_code=404, detail="该文件未提取到文本内容，无法预览")
+
+    pages = text_locator.split_pages(text)
+
+    # —— 选页：start 优先，其次 page，默认第 1 页 ——
+    target: dict | None = None
+    if start is not None and start >= 0:
+        target = text_locator.page_for_offset(pages, start)
+    elif page is not None:
+        target = next((p for p in pages if p["page"] == page), None)
+        if target is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"页码超出范围：文档共 {pages[-1]['page']} 页",
+            )
+    target = target or pages[0]
+
+    page_text = text[target["start"] : target["end"]]
+
+    # —— 计算页内高亮区间 ——
+    highlights: list[dict[str, int]] = []
+    match_meta: dict[str, object] = {}
+    if start is not None and target["start"] <= start < target["end"]:
+        # 绝对下标 → 页内下标；end 缺省时用 snippet 长度或单字符兜底
+        h_start = start - target["start"]
+        if end is not None and end > start:
+            h_end = min(end, target["end"]) - target["start"]
+        elif snippet:
+            h_end = min(h_start + len(snippet.strip()), len(page_text))
+        else:
+            h_end = h_start + 1
+        highlights.append({"start": h_start, "end": h_end})
+        match_meta = {"match_type": "located", "source": "offset"}
+    elif snippet and snippet.strip():
+        # 页内二次定位（同一套三级匹配，保证与全文定位结果一致）
+        hit = text_locator.locate(page_text, snippet, context_chars=0)
+        if hit:
+            highlights.append({"start": hit["start"], "end": hit["end"]})
+            match_meta = {
+                "match_type": hit["match_type"],
+                "confidence": hit["confidence"],
+                "source": "page_locate",
+            }
+
+    return {
+        "file_id": file_id,
+        "filename": record["filename"],
+        "ext": record.get("ext"),
+        "page": target["page"],
+        "page_label": target["label"],
+        "page_count": pages[-1]["page"],
+        "is_paged": pages[-1]["page"] > 1 or pages[0]["label"] != "全文",
+        "page_text": page_text,
+        "highlights": highlights,
+        **match_meta,
+    }
+
+
 @router.get("/{file_id}/text", summary="获取文件提取后的纯文本内容")
 async def get_text(file_id: str, limit: int = 20000, caller: dict = Depends(deps.get_caller)):
     record = file_store.get(file_id)

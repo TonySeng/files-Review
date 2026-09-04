@@ -346,3 +346,55 @@ def locate_in_docs(
     order = {"exact": 0, "normalized": 1, "fuzzy": 2}
     results.sort(key=lambda r: (order.get(r["match_type"], 3), -r["confidence"]))
     return results
+
+
+# ---------------------------------------------------------------------------
+# 分页预览：与 locate 共用同一份「带位置标记的提取文本」，保证预览/跳转/高亮对齐
+# ---------------------------------------------------------------------------
+
+_PAGE_MARKER_RE = re.compile(r"\[第(\d+)页\]")
+
+
+def split_pages(text: str) -> list[dict[str, Any]]:
+    """把带 `[第N页]` 标记的提取文本切分为页清单。
+
+    Returns:
+        每项 {page, label, start, end}：start/end 为该页正文在全文中的
+        绝对下标（不含页标记本身）；无页标记的文档（docx/txt/xlsx 等）
+        视为单页「全文」。
+    """
+    hits = list(_PAGE_MARKER_RE.finditer(text))
+    if not hits:
+        return [{"page": 1, "label": "全文", "start": 0, "end": len(text)}]
+
+    pages: list[dict[str, Any]] = []
+    for i, m in enumerate(hits):
+        body_start = m.end()
+        # 去掉标记后紧跟的空行，正文起点落到首个实际字符
+        while body_start < len(text) and text[body_start] in "\r\n":
+            body_start += 1
+        body_end = hits[i + 1].start() if i + 1 < len(hits) else len(text)
+        # 页尾回退本页与下页标记间的分隔空行
+        while body_end > body_start and text[body_end - 1] in "\r\n":
+            body_end -= 1
+        pages.append(
+            {"page": int(m.group(1)), "label": f"第{m.group(1)}页",
+             "start": body_start, "end": body_end}
+        )
+    # 标记之前可能存在首页标记之前的少量正文（如 OCR 头部），并入第 1 页前的前言页
+    if hits[0].start() > 0 and text[: hits[0].start()].strip():
+        pages.insert(0, {"page": 0, "label": "封面/前言", "start": 0, "end": hits[0].start()})
+    return pages
+
+
+def page_for_offset(pages: list[dict[str, Any]], offset: int) -> dict[str, Any] | None:
+    """返回包含绝对下标 offset 的页。
+
+    offset 落在页标记本身（页间缝隙）时归入下一页——标记即该页的起点。
+    """
+    # 12 = 最长页标记「[第100页]」的长度：offset 落在标记上时属于该标记指向的页
+    for p in pages:
+        if p["start"] - 12 <= offset < p["end"]:
+            return p
+    # 仍无命中（offset 超出末页等），取最后一页
+    return pages[-1] if pages else None

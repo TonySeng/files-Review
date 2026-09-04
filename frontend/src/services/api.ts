@@ -41,6 +41,7 @@ import type {
   PromptDetail,
   PromptDiffResult,
   PromptMeta,
+  FilePreview,
   PromptTestResult,
   StorageStatus,
 } from '../types'
@@ -699,6 +700,18 @@ export const api = {
 
   clearTasks() {
     return request<{ cleared: boolean }>('/review/tasks?confirm=yes', { method: 'DELETE' })
+  },
+
+  getFilePreview(
+    fileId: string,
+    params: { page?: number; start?: number; end?: number; snippet?: string } = {},
+  ) {
+    const qs = new URLSearchParams()
+    if (params.page != null) qs.set('page', String(params.page))
+    if (params.start != null) qs.set('start', String(params.start))
+    if (params.end != null) qs.set('end', String(params.end))
+    if (params.snippet) qs.set('snippet', params.snippet)
+    return request<FilePreview>(`/files/${fileId}/preview?${qs.toString()}`)
   },
 
   locateSnippet(

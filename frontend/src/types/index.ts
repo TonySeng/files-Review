@@ -691,6 +691,22 @@ export interface LocateMatch {
   truncated_after: boolean
 }
 
+/** 原文分页预览（GET /api/files/{id}/preview） */
+export interface FilePreview {
+  file_id: string
+  filename: string
+  ext: string | null
+  page: number
+  page_label: string
+  page_count: number
+  is_paged: boolean
+  page_text: string
+  highlights: { start: number; end: number }[]
+  match_type?: string
+  confidence?: number
+  source?: string
+}
+
 // --------------------------- Prompt 统一管理 --------------------------- //
 
 /** 提示词模板版本 */

@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>通用文件审核工作台（对齐现有 App v1 设计）</title>
+<style>
+  :root{
+    --rm-surface:#ffffff; --rm-border:#e8eaed; --rm-border-strong:#d6dae0;
+    --rm-text:#1f2329; --rm-text-sub:#646a73; --rm-text-mute:#8f959e;
+    --rm-primary:#1668dc; --rm-primary-soft:#eef4ff; --rm-radius:12px;
+    --rm-radius-sm:8px; --rm-shadow-sm:0 1px 2px rgba(0,0,0,.04),0 2px 8px rgba(0,0,0,.04);
+    --rm-shadow-md:0 6px 20px rgba(20,30,60,.12); --rm-gap:16px;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB',sans-serif;background:#f5f6f8;color:var(--rm-text);}
+  /* 顶栏（仅保留产品名 + 状态 + 一个系统配置齿轮，避免按钮重复） */
+  .app-header{display:flex;align-items:center;justify-content:space-between;padding:0 24px;background:#fff;border-bottom:1px solid #e5e6eb;height:56px;position:sticky;top:0;z-index:50;}
+  .app-title{font-size:17px;font-weight:600;display:flex;align-items:center;gap:10px;}
+  .app-title .dot{color:var(--rm-primary);font-size:20px;}
+  .app-header-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+  .btn{height:34px;padding:0 16px;border-radius:8px;border:1px solid var(--rm-border);background:#fff;color:var(--rm-text-sub);cursor:pointer;font-size:14px;display:inline-flex;align-items:center;gap:6px;transition:.15s;}
+  .btn:hover{border-color:var(--rm-primary);color:var(--rm-primary);background:var(--rm-primary-soft);}
+  .btn.primary{background:var(--rm-primary);color:#fff;border-color:var(--rm-primary);}
+  .btn.primary:hover{background:#2f7de0;color:#fff;}
+  .tag{display:inline-flex;align-items:center;height:22px;padding:0 8px;border-radius:6px;font-size:12px;background:#eef0f3;color:var(--rm-text-sub);}
+  .tag.gold{background:#fff7e6;color:#d48806;} .tag.blue{background:#e6f4ff;color:#1677ff;}
+  .tag.geek{background:#f0f5ff;color:#2f54eb;} .tag.green{background:#f6ffed;color:#389e0d;}
+  .tag.red{background:#fff1f0;color:#cf1322;}
+  .status-dot{width:8px;height:8px;border-radius:50%;background:#52c41a;display:inline-block;}
+
+  /* 系统配置抽屉 */
+  .scrim{position:fixed;inset:0;background:rgba(20,30,60,.35);opacity:0;pointer-events:none;transition:.2s;z-index:100;}
+  .scrim.open{opacity:1;pointer-events:auto;}
+  .drawer{position:fixed;top:0;right:0;height:100vh;width:520px;max-width:94vw;background:#fff;box-shadow:-8px 0 30px rgba(20,30,60,.18);transform:translateX(100%);transition:.25s;z-index:101;display:flex;flex-direction:column;}
+  .drawer.open{transform:none;}
+  .drawer-head{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--rm-border);}
+  .drawer-title{font-size:16px;font-weight:600;}
+  .drawer-body{padding:8px 20px 24px;overflow-y:auto;flex:1;}
+  .drawer-foot{padding:12px 20px;border-top:1px solid var(--rm-border);display:flex;justify-content:flex-end;gap:10px;}
+  .sec{margin-top:18px;}
+  .sec-h{font-size:13px;font-weight:600;color:var(--rm-text-sub);letter-spacing:.3px;margin:0 0 10px;display:flex;align-items:center;gap:8px;}
+  .sec-h::before{content:"";width:3px;height:14px;background:var(--rm-primary);border-radius:2px;}
+  .field{margin-bottom:12px;}
+  .field>label{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--rm-text);margin-bottom:6px;}
+  .inp{width:100%;height:34px;padding:0 10px;border:1px solid var(--rm-border-strong);border-radius:8px;font-size:13px;background:#fff;color:var(--rm-text);outline:none;}
+  .inp:focus{border-color:var(--rm-primary);box-shadow:0 0 0 2px rgba(22,104,220,.12);}
+  .row2{display:flex;gap:10px;}
+  .row2>*{flex:1;min-width:0;}
+  .link-btn{background:none;border:none;color:var(--rm-primary);cursor:pointer;font-size:12px;padding:0;}
+  .test-tag{font-size:12px;padding:1px 8px;border-radius:999px;}
+  .test-tag.ok{background:#f6ffed;color:#389e0d;} .test-tag.err{background:#fff1f0;color:#cf1322;} .test-tag.load{background:#e6f4ff;color:#1677ff;}
+  .switch{width:42px;height:24px;border-radius:999px;background:#d6dae0;position:relative;cursor:pointer;transition:.2s;border:none;flex:none;}
+  .switch.on{background:var(--rm-primary);}
+  .switch::after{content:"";position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:#fff;transition:.2s;}
+  .switch.on::after{left:20px;}
+  .alert{background:#fffbe6;border:1px solid #ffe58f;border-radius:8px;padding:10px 12px;font-size:12.5px;color:#874d00;margin-top:10px;line-height:1.6;}
+  .alert.info{background:#e6f4ff;border-color:#91caff;color:#0958d9;}
+
+  /* 规则/类型管理页 */
+  .rm-page{max-width:1560px;margin:0 auto;padding:20px 24px 48px;}
+  .rm-topbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding-bottom:18px;margin-bottom:18px;border-bottom:1px solid var(--rm-border);}
+  .rm-title{font-size:20px;font-weight:650;display:flex;align-items:center;gap:10px;}
+  .rm-title .i{color:var(--rm-primary);}
+  .rm-sub{font-size:13px;color:var(--rm-text-mute);}
+  .rm-layout{display:flex;gap:var(--rm-gap);align-items:flex-start;}
+  .rm-side{width:288px;flex:none;background:#fff;border:1px solid var(--rm-border);border-radius:var(--rm-radius);padding:14px 12px;position:sticky;top:72px;box-shadow:var(--rm-shadow-sm);}
+  .rm-group+.rm-group{margin-top:18px;padding-top:16px;border-top:1px dashed var(--rm-border);}
+  .rm-group-h{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--rm-text-mute);margin:0 6px 10px;letter-spacing:.4px;}
+  .rm-set{display:flex;align-items:center;gap:10px;padding:10px;border-radius:10px;cursor:pointer;border:1px solid transparent;color:var(--rm-text);}
+  .rm-set:hover{background:#f5f7fa;}
+  .rm-set.active{background:var(--rm-primary-soft);border-color:rgba(22,104,220,.4);color:var(--rm-primary);font-weight:600;}
+  .rm-set .n{flex:1;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .rm-set .c{font-size:12px;background:#eef0f3;color:var(--rm-text-sub);border-radius:999px;padding:0 7px;height:20px;display:inline-flex;align-items:center;min-width:22px;justify-content:center;}
+  .rm-set.active .c{background:#fff;color:var(--rm-primary);}
+  .rm-content{flex:1;min-width:0;display:flex;flex-direction:column;gap:var(--rm-gap);}
+  .rm-head{background:#fff;border:1px solid var(--rm-border);border-radius:var(--rm-radius);padding:18px 20px;box-shadow:var(--rm-shadow-sm);display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;}
+  .rm-head .t{font-size:17px;font-weight:600;display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+  .rm-filter{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;background:#fff;border:1px solid var(--rm-border);border-radius:var(--rm-radius);padding:12px 14px;box-shadow:var(--rm-shadow-sm);}
+  .chip{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border-radius:999px;border:1px solid var(--rm-border);background:#fff;color:var(--rm-text-sub);font-size:13px;cursor:pointer;}
+  .chip.active{background:var(--rm-primary);color:#fff;border-color:var(--rm-primary);}
+  .chip .d{width:8px;height:8px;border-radius:50%;}
+  .chip .num{opacity:.85;font-variant-numeric:tabular-nums;}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:var(--rm-gap);}
+  .rc{position:relative;display:flex;flex-direction:column;gap:10px;min-height:134px;padding:16px 16px 14px 18px;background:#fff;border:1px solid var(--rm-border);border-radius:var(--rm-radius);overflow:hidden;cursor:pointer;transition:.15s;}
+  .rc::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--rm-accent,var(--rm-text-mute));}
+  .rc:hover{transform:translateY(-2px);box-shadow:var(--rm-shadow-md);}
+  .rc .top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;}
+  .rc .nm{font-size:15px;font-weight:600;}
+  .rc .ds{font-size:13px;color:var(--rm-text-sub);line-height:1.65;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+  .rc .ft{margin-top:auto;font-size:12px;color:var(--rm-text-mute);}
+  .empty{border:1px dashed var(--rm-border-strong);border-radius:var(--rm-radius);padding:48px;text-align:center;color:var(--rm-text-mute);background:#fff;}
+
+  /* 工作台 */
+  .wb{max-width:1560px;margin:0 auto;padding:20px 24px 40px;display:grid;grid-template-columns:360px 1fr;gap:var(--rm-gap);}
+  @media(max-width:992px){.wb{grid-template-columns:1fr;}}
+  .card{background:#fff;border:1px solid var(--rm-border);border-radius:var(--rm-radius);padding:16px;box-shadow:var(--rm-shadow-sm);}
+  .card h3{margin:0 0 12px;font-size:15px;font-weight:600;}
+  .opt{display:flex;align-items:flex-start;gap:10px;margin-bottom:12px;}
+  .opt .lb{flex:1;font-size:13px;}
+  .opt .lb .sub{font-size:12px;color:var(--rm-text-mute);margin-top:2px;line-height:1.5;}
+  .sel{width:100%;height:34px;padding:0 10px;border:1px solid var(--rm-border-strong);border-radius:8px;font-size:13px;background:#fff;color:var(--rm-text);margin-top:4px;}
+  .nav-pills{display:flex;gap:8px;padding:12px 24px;max-width:1560px;margin:0 auto;overflow-x:auto;}
+  .pill{height:32px;padding:0 14px;border-radius:999px;border:1px solid var(--rm-border);background:#fff;color:var(--rm-text-sub);cursor:pointer;font-size:13px;white-space:nowrap;}
+  .pill.active{background:var(--rm-primary);color:#fff;border-color:var(--rm-primary);}
+  .hidden{display:none!important;}
+  .hint{font-size:12px;color:var(--rm-text-mute);margin-top:6px;line-height:1.5;}
+
+  /* 工作台：待审文件 */
+  .fp-drag{display:block;border:1.5px dashed var(--rm-border-strong);border-radius:10px;padding:18px 12px;text-align:center;cursor:pointer;transition:.15s;background:#fafbfc;margin-bottom:12px;}
+  .fp-drag:hover{border-color:var(--rm-primary);background:var(--rm-primary-soft);}
+  .fp-drag .ic{font-size:24px;color:var(--rm-primary);line-height:1;}
+  .fp-drag .t{font-size:13px;margin-top:6px;color:var(--rm-text);}
+  table.fp{width:100%;border-collapse:collapse;font-size:12.5px;}
+  table.fp th{text-align:left;color:var(--rm-text-mute);font-weight:600;padding:8px 6px;border-bottom:1px solid var(--rm-border);}
+  table.fp td{padding:8px 6px;border-bottom:1px solid #f2f3f5;vertical-align:middle;}
+  table.fp tr:last-child td{border-bottom:none;}
+  .mini-sel{height:28px;border:1px solid var(--rm-border-strong);border-radius:6px;font-size:12px;padding:0 4px;background:#fff;color:var(--rm-text);}
+  .ico-btn{border:none;background:none;cursor:pointer;color:var(--rm-text-sub);font-size:14px;padding:2px 7px;border-radius:6px;line-height:1;}
+  .ico-btn:hover{background:#f0f2f5;color:var(--rm-primary);}
+
+  /* 工作台：规则组多选 */
+  .grp-wrap{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px;}
+  .grp-chip{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border-radius:999px;border:1px solid var(--rm-border);background:#fff;color:var(--rm-text-sub);font-size:13px;cursor:pointer;transition:.12s;}
+  .grp-chip.active{background:var(--rm-primary);color:#fff;border-color:var(--rm-primary);}
+  .grp-chip .g{font-size:12px;opacity:.8;}
+  .grp-wrap.locked .grp-chip{cursor:not-allowed;opacity:.92;}
+
+  /* 工作台：审核规则（规则集选择，向下钻取到规则组） */
+  .rs-sel{height:34px;border:1px solid var(--rm-border-strong);border-radius:8px;padding:0 10px;font-size:13px;flex:1;min-width:0;background:#fff;color:var(--rm-text);}
+  .stack{display:flex;flex-direction:column;gap:var(--rm-gap);}
+
+  /* 配置页：文件类型 / 规则组 详情表单 */
+  .ft-meta{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px;}
+  .ft-form{background:#fff;border:1px solid var(--rm-border);border-radius:var(--rm-radius);padding:18px 20px;box-shadow:var(--rm-shadow-sm);}
+  .tag-input{display:flex;gap:6px;flex-wrap:wrap;align-items:center;border:1px solid var(--rm-border-strong);border-radius:8px;padding:8px 10px;min-height:42px;}
+  .tag-input .t{display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 8px;border-radius:6px;background:var(--rm-primary-soft);color:var(--rm-primary);font-size:12px;}
+  .tag-input .t .x{cursor:pointer;font-weight:700;}
+  .rule-check{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--rm-border);border-radius:10px;margin-bottom:8px;cursor:pointer;}
+  .rule-check:hover{background:#f5f7fa;}
+  .rule-check .meta{flex:1;}
+  .rule-check .meta .nm{font-size:13.5px;font-weight:600;}
+  .rule-check .meta .ds{font-size:12px;color:var(--rm-text-mute);line-height:1.5;}
+
+  /* 审核历史 */
+  .task-list{display:flex;flex-direction:column;gap:10px;margin-top:4px;}
+  .task-row{border:1px solid var(--rm-border);border-radius:10px;padding:12px 14px;cursor:pointer;transition:.15s;background:#fff;}
+  .task-row:hover{border-color:var(--rm-primary);box-shadow:var(--rm-shadow-sm);}
+  .task-row .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px;}
+  .task-row .meta{font-size:12px;color:var(--rm-text-mute);line-height:1.5;}
+  .task-row .bar{height:6px;border-radius:999px;background:#eef0f3;overflow:hidden;margin-top:8px;}
+  .task-row .bar>i{display:block;height:100%;background:var(--rm-primary);}
+  .mini-btn{height:26px;padding:0 10px;border:1px solid var(--rm-border);border-radius:6px;background:#fff;color:var(--rm-text-sub);font-size:12px;cursor:pointer;}
+  .mini-btn:hover{border-color:var(--rm-primary);color:var(--rm-primary);}
+  .mini-btn.danger{color:#cf1322;border-color:#ffccc7;}
+  .mini-btn.danger:hover{background:#fff1f0;color:#cf1322;}
+
+  /* 任务详情抽屉内：审核项 + 反馈 */
+  .find{border:1px solid var(--rm-border);border-radius:10px;padding:12px 14px;margin-bottom:10px;background:#fff;}
+  .find .h{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:6px;flex-wrap:wrap;}
+  .find .body{font-size:13px;color:var(--rm-text-sub);line-height:1.7;}
+  .fb-inline{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;}
+  .fb-input{width:100%;height:34px;border:1px solid var(--rm-border-strong);border-radius:7px;padding:0 10px;font-size:13px;margin-top:8px;}
+
+  /* 反馈与训练数据 */
+  .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;}
+  @media(max-width:768px){.stat-grid{grid-template-columns:repeat(2,1fr);}}
+  .stat{background:#fff;border:1px solid var(--rm-border);border-radius:var(--rm-radius);padding:14px 16px;}
+  .stat .v{font-size:24px;font-weight:700;line-height:1.1;}
+  .stat .l{font-size:12px;color:var(--rm-text-mute);margin-top:4px;}
+  .fb-tabs{display:flex;gap:6px;border-bottom:1px solid var(--rm-border);margin:14px 0 12px;flex-wrap:wrap;}
+  .fb-tab{padding:8px 12px;font-size:13px;cursor:pointer;color:var(--rm-text-sub);border-bottom:2px solid transparent;margin-bottom:-1px;}
+  .fb-tab.active{color:var(--rm-primary);border-bottom-color:var(--rm-primary);font-weight:600;}
+  .fb-pane{display:none;}
+  .fb-pane.active{display:block;}
+  .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;}
+</style>
+</head>
+<body>
+
+<!-- 顶栏：仅产品名 + 状态 + 一个系统配置入口（消除重复按钮） -->
+<header class="app-header">
+  <div class="app-title"><span class="dot">◆</span><span>通用文件审核工作台</span></div>
+  <div class="app-header-actions">
+    <span class="status-dot"></span><span style="font-size:12px;color:var(--rm-text-sub)">后端已连接</span>
+    <button class="btn" onclick="openDrawer()"><span style="font-size:15px">⚙</span> 系统配置</button>
+  </div>
+</header>
+
+<!-- 统一导航：所有页面入口集中于此，不再与顶栏重复 -->
+<nav class="nav-pills">
+  <button class="pill active" data-p="wb" onclick="go('wb')">工作台</button>
+  <button class="pill" data-p="filetypes" onclick="go('filetypes')">文件类型配置</button>
+  <button class="pill" data-p="rulegroups" onclick="go('rulegroups')">审核规则组</button>
+  <button class="pill" data-p="rules" onclick="go('rules')">审核规则</button>
+  <button class="pill" data-p="history" onclick="go('history')">审核历史</button>
+  <button class="pill" data-p="feedback" onclick="go('feedback')">反馈与训练数据</button>
+</nav>
+
+<!-- 工作台：上传文件 + 指定类型 + 审核规则组（多选/自动匹配）+ 审核选项 -->
+<section id="view-wb" class="wb">
+  <!-- 左列：待审文件 + 审核规则组选择 -->
+  <div class="stack">
+
+    <!-- 待审文件 -->
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h3 style="margin:0">待审文件</h3>
+        <span class="tag">已选 2 / 3</span>
+      </div>
+      <label class="fp-drag" onclick="alert('选择文件后由后端解析（PDF/Word/Excel/图片，扫描件自动OCR）')">
+        <div class="ic">📥</div>
+        <div class="t">点击或拖拽文件到此处上传</div>
+        <div class="hint" style="margin-top:2px">支持 PDF / Word / Excel / 图片，扫描件自动 OCR</div>
+        <input type="file" multiple hidden />
+      </label>
+      <div class="alert info" style="margin-top:10px">系统不会自动识别文件类型，请为每个文件<span style="font-weight:600">手动指定类型</span>；开启「自动匹配规则组」后，将依你指定的类型自动套用对应规则组。</div>
+      <table class="fp">
+        <thead><tr><th>文件名</th><th>文件类型（手动指定）</th><th style="text-align:right">字数</th><th>状态</th><th></th></tr></thead>
+        <tbody>
+          <tr>
+            <td>XX项目招标文件.pdf <span title="含扫描页，已通过 OCR 识别">🔍</span></td>
+            <td><select class="mini-sel ft-type-select" onchange="fileTypeChanged()"><option>招标文件</option><option>投标文件</option><option>合同协议</option><option>资质证明</option><option selected>通用文档</option></select></td>
+            <td style="text-align:right">12,480</td>
+            <td><span class="tag green">已解析</span></td>
+            <td><button class="ico-btn" title="预览">👁</button><button class="ico-btn" title="删除">🗑</button></td>
+          </tr>
+          <tr>
+            <td>XX公司投标文件.docx</td>
+            <td><select class="mini-sel ft-type-select" onchange="fileTypeChanged()"><option>招标文件</option><option selected>投标文件</option><option>合同协议</option><option>资质证明</option><option>通用文档</option></select></td>
+            <td style="text-align:right">8,960</td>
+            <td><span class="tag green">已解析</span></td>
+            <td><button class="ico-btn" title="预览">👁</button><button class="ico-btn" title="删除">🗑</button></td>
+          </tr>
+          <tr>
+            <td>资质证明扫描件.png <span title="含扫描页，已通过 OCR 识别">🔍</span></td>
+            <td><select class="mini-sel ft-type-select" onchange="fileTypeChanged()"><option>招标文件</option><option>投标文件</option><option>合同协议</option><option selected>资质证明</option><option>通用文档</option></select></td>
+            <td style="text-align:right">—</td>
+            <td><span class="tag green">已解析</span></td>
+            <td><button class="ico-btn" title="预览">👁</button><button class="ico-btn" title="删除">🗑</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 审核规则组（多选 + 自动匹配开关） -->
+    <div class="card">
+      <h3>审核规则组</h3>
+      <div class="opt" style="align-items:center">
+        <button class="switch" id="autoMatch" onclick="toggleAuto()"></button>
+        <div class="lb">自动根据文件类型匹配规则组
+          <div class="sub">开启后，依你在上方为每个文件指定的类型，自动套用其关联的规则组（仍需你手动指定类型，系统不自动分类文件）</div>
+        </div>
+      </div>
+      <div class="alert info hidden" id="autoNote">已依据所选文件类型自动匹配规则组，可在下方手动增删。</div>
+      <div class="hint" style="margin-bottom:8px">从规则组中选择本次审核使用的组合（可多选）：</div>
+      <div class="grp-wrap" id="grpSelect">
+        <span class="grp-chip active" data-g="完整性组" onclick="toggleGrp(this)">完整性组 <span class="g">6</span></span>
+        <span class="grp-chip" data-g="一致性组" onclick="toggleGrp(this)">一致性组 <span class="g">4</span></span>
+        <span class="grp-chip" data-g="规范性组" onclick="toggleGrp(this)">规范性组 <span class="g">5</span></span>
+        <span class="grp-chip" data-g="合规性组" onclick="toggleGrp(this)">合规性组 <span class="g">8</span></span>
+        <span class="grp-chip" data-g="签署有效期组" onclick="toggleGrp(this)">签署有效期组 <span class="g">3</span></span>
+      </div>
+      <div class="hint" style="margin-top:8px">规则组由「审核规则组」页管理；其下包含的具体规则见「审核规则」页。点击左列规则集也可快速切换预置组合。</div>
+    </div>
+
+  </div>
+
+  <!-- 右列：审核选项（联网搜索 + 知识库检索，任务级） -->
+  <div class="card">
+    <h3>审核选项</h3>
+    <div class="opt">
+      <button class="switch on" onclick="this.classList.toggle('on')"></button>
+      <div class="lb">启用法规知识库检索
+        <div class="sub">开启后模型自主判断规则是否需法规依据并检索本地知识库</div>
+      </div>
+    </div>
+    <div class="field">
+      <label>关联检索知识库（本任务）</label>
+      <select class="sel">
+        <option>通用法规库（128 篇文档）</option>
+        <option>行业资质库（42 篇文档）</option>
+        <option selected>— 留空：使用系统默认知识库 —</option>
+      </select>
+      <div class="hint">留空则使用系统配置中默认的知识库</div>
+    </div>
+    <div class="alert">未选择知识库：请在「系统配置」中选择知识库，否则无法检索法规依据。</div>
+
+    <div class="opt" style="margin-top:14px">
+      <button class="switch" onclick="this.classList.toggle('on')"></button>
+      <div class="lb">启用联网搜索
+        <div class="sub">获取最新政策、行业动态等实时信息（需配置 API 密钥）</div>
+      </div>
+    </div>
+    <div class="alert hidden" id="wsAlert">未配置联网搜索：请在「系统配置」中配置联网搜索 API 密钥。</div>
+
+    <div class="field" style="margin-top:14px">
+      <label>补充审核要求（选填）</label>
+      <textarea class="inp" style="height:60px;padding:8px 10px;resize:vertical" placeholder="例如：重点核查金额一致性与签署有效期"></textarea>
+    </div>
+    <button class="btn primary" style="width:100%;justify-content:center;margin-top:6px" onclick="alert('已提交后台审核任务（多文件一并提交，按所选规则组审核）')">开始审核（后台执行）</button>
+  </div>
+</section>
+
+<!-- 文件类型配置 -->
+<section id="view-filetypes" class="rm-page hidden">
+  <div class="rm-topbar">
+    <button class="btn" onclick="go('wb')" style="border-radius:999px">← 返回工作台</button>
+    <div>
+      <div class="rm-title"><span class="i">🗂</span>文件类型配置</div>
+      <div class="rm-sub">定义可审核的文件类型，并为其关联审核规则组（用于自动匹配）</div>
+    </div>
+  </div>
+  <div class="rm-layout">
+    <aside class="rm-side">
+      <div class="rm-group">
+        <div class="rm-group-h">文件类型 <button class="btn primary" style="margin-left:auto;height:26px;padding:0 12px;font-size:12px;border-radius:999px">+ 新建</button></div>
+        <div class="rm-set active" onclick="selSet(this)"><span>📄</span><span class="n">招标文件</span><span class="c">2 组</span></div>
+        <div class="rm-set" onclick="selSet(this)"><span>📄</span><span class="n">投标文件</span><span class="c">4 组</span></div>
+        <div class="rm-set" onclick="selSet(this)"><span>📄</span><span class="n">合同协议</span><span class="c">2 组</span></div>
+        <div class="rm-set" onclick="selSet(this)"><span>📄</span><span class="n">资质证明</span><span class="c">1 组</span></div>
+        <div class="rm-set" onclick="selSet(this)"><span>📄</span><span class="n">通用文档</span><span class="c">1 组</span></div>
+      </div>
+    </aside>
+    <section class="rm-content">
+      <div class="rm-head">
+        <div>
+          <div class="t">招标文件 <span class="tag">2 个关联规则组</span></div>
+          <div class="hint" style="margin-top:6px">用于承载招标要求与评分办法的文件；审核时通常需核查完整性与合规性。</div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn">删除</button>
+          <button class="btn primary">保存</button>
+        </div>
+      </div>
+      <div class="ft-form">
+        <div class="field"><label>类型名称</label><input class="inp" value="招标文件"></div>
+        <div class="field"><label>说明</label><input class="inp" value="招标公告、招标文件、评分办法等"></div>
+        <div class="field">
+          <label>允许的文件后缀（空表示不限制）</label>
+          <div class="tag-input">
+            <span class="t">.pdf <span class="x" onclick="this.parentElement.remove()">×</span></span>
+            <span class="t">.doc <span class="x" onclick="this.parentElement.remove()">×</span></span>
+            <span class="t">.docx <span class="x" onclick="this.parentElement.remove()">×</span></span>
+            <input class="inp" style="border:none;height:28px;flex:1;min-width:120px;padding:0" placeholder="输入后缀后回车添加">
+          </div>
+        </div>
+        <div class="field">
+          <label>关联审核规则组（可多选）</label>
+          <div class="grp-wrap" id="ftGroups">
+            <span class="grp-chip active" data-g="完整性组" onclick="toggleGrp(this)">完整性组</span>
+            <span class="grp-chip" data-g="一致性组" onclick="toggleGrp(this)">一致性组</span>
+            <span class="grp-chip" data-g="规范性组" onclick="toggleGrp(this)">规范性组</span>
+            <span class="grp-chip active" data-g="合规性组" onclick="toggleGrp(this)">合规性组</span>
+            <span class="grp-chip" data-g="签署有效期组" onclick="toggleGrp(this)">签署有效期组</span>
+          </div>
+          <div class="hint">上传时若开启「自动匹配规则组」，系统将依文件类型自动勾选以上规则组。</div>
+        </div>
+      </div>
+    </section>
+  </div>
+</section>
+
+<!-- 审核规则组 -->
+<section id="view-rulegroups" class="rm-page hidden">
+  <div class="rm-topbar">
+    <button class="btn" onclick="go('wb')" style="border-radius:999px">← 返回工作台</button>
+    <div>
+      <div class="rm-title"><span class="i">🧩</span>审核规则组</div>
+      <div class="rm-sub">规则组是规则的命名组合，可多选套用到任务；在此管理每组包含的具体规则</div>
+    </div>
+  </div>
+  <div class="rm-layout">
+    <aside class="rm-side">
+      <div class="rm-group">
+        <div class="rm-group-h">规则组 <button class="btn primary" style="margin-left:auto;height:26px;padding:0 12px;font-size:12px;border-radius:999px">+ 新建</button></div>
+        <div class="rm-set active" onclick="selSet(this)"><span>🧩</span><span class="n">完整性组</span><span class="c">6</span></div>
+        <div class="rm-set" onclick="selSet(this)"><span>🧩</span><span class="n">一致性组</span><span class="c">4</span></div>
+        <div class="rm-set" onclick="selSet(this)"><span>🧩</span><span class="n">规范性组</span><span class="c">5</span></div>
+        <div class="rm-set" onclick="selSet(this)"><span>🧩</span><span class="n">合规性组</span><span class="c">8</span></div>
+        <div class="rm-set" onclick="selSet(this)"><span>🧩</span><span class="n">签署有效期组</span><span class="c">3</span></div>
+      </div>
+    </aside>
+    <section class="rm-content">
+      <div class="rm-head">
+        <div>
+          <div class="t">完整性组 <span class="tag">6 条规则</span><span class="tag geek">可多选套用</span></div>
+          <div class="hint" style="margin-top:6px">核查文件关键要素是否齐全。在「工作台」与「文件类型配置」中均可多选此组。</div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn">删除</button>
+          <button class="btn primary">保存</button>
+        </div>
+      </div>
+      <div class="rm-filter">
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="chip active">全部 <span class="num">18</span></button>
+          <button class="chip"><span class="d" style="background:#ff4d4f"></span>严重 <span class="num">3</span></button>
+          <button class="chip"><span class="d" style="background:#faad14"></span>警告 <span class="num">7</span></button>
+          <button class="chip"><span class="d" style="background:#52c41a"></span>提示 <span class="num">8</span></button>
+        </div>
+        <div style="display:flex;gap:10px">
+          <input class="inp" style="width:220px" placeholder="搜索规则名称或说明" />
+        </div>
+      </div>
+      <div style="font-size:13px;font-weight:600;margin:4px 0 10px">本组包含的规则（勾选加入 / 取消移出）</div>
+      <div class="rule-check" onclick="this.querySelector('input').click()"><input type="checkbox" checked><div class="meta"><div class="nm">关键字段完整性核查</div><div class="ds">必填项（名称、编号、金额、日期）是否缺失。</div></div><span class="tag red">严重</span></div>
+      <div class="rule-check" onclick="this.querySelector('input').click()"><input type="checkbox" checked><div class="meta"><div class="nm">附件清单完整性</div><div class="ds">所列附件是否与实际提交一致。</div></div><span class="tag" style="background:#fff7e6;color:#d48806">警告</span></div>
+      <div class="rule-check" onclick="this.querySelector('input').click()"><input type="checkbox" checked><div class="meta"><div class="nm">签章与落款完整性</div><div class="ds">是否缺签名、盖章、日期。</div></div><span class="tag" style="background:#fff7e6;color:#d48806">警告</span></div>
+      <div class="rule-check" onclick="this.querySelector('input').click()"><input type="checkbox" checked><div class="meta"><div class="nm">页码与目录连续性</div><div class="ds">目录与正文页码是否对应。</div></div><span class="tag green">提示</span></div>
+      <div class="rule-check" onclick="this.querySelector('input').click()"><input type="checkbox" checked><div class="meta"><div class="nm">有效期字段完整性</div><div class="ds">证书 / 资质有效期字段是否填写。</div></div><span class="tag" style="background:#fff7e6;color:#d48806">警告</span></div>
+      <div class="rule-check" onclick="this.querySelector('input').click()"><input type="checkbox"><div class="meta"><div class="nm">金额数值一致性</div><div class="ds">大小写、分项与总价是否一致。</div></div><span class="tag" style="background:#fff7e6;color:#d48806">警告</span></div>
+      <div class="rule-check" onclick="this.querySelector('input').click()"><input type="checkbox"><div class="meta"><div class="nm">错别字与表述规范</div><div class="ds">常见错别字与不规范表述。</div></div><span class="tag green">提示</span></div>
+    </section>
+  </div>
+</section>
+
+<!-- 审核规则（规则清单管理） -->
+<section id="view-rules" class="rm-page hidden">
+  <div class="rm-topbar">
+    <button class="btn" onclick="go('wb')" style="border-radius:999px">← 返回工作台</button>
+    <div>
+      <div class="rm-title"><span class="i">▦</span>审核规则</div>
+      <div class="rm-sub">集中管理规则清单，规则按类别与严重度归集到规则组，供规则组自由组合</div>
+    </div>
+  </div>
+  <div class="rm-layout">
+    <aside class="rm-side">
+      <div class="rm-group">
+        <div class="rm-group-h">系统预置规则集</div>
+        <div class="rm-set active" onclick="selSet(this)"><span>📄</span><span class="n">通用审核规则（预置）</span><span class="c">18</span></div>
+        <div class="rm-set" onclick="selSet(this)"><span>📄</span><span class="n">文档完整性规则（预置）</span><span class="c">6</span></div>
+      </div>
+      <div class="rm-group">
+        <div class="rm-group-h">我的规则集 <button class="btn primary" style="margin-left:auto;height:26px;padding:0 12px;font-size:12px;border-radius:999px">+ 新建</button></div>
+        <div class="rm-set" onclick="selSet(this)"><span>📄</span><span class="n">某项目专用规则集</span><span class="c">6</span></div>
+      </div>
+    </aside>
+    <section class="rm-content">
+      <div class="rm-head">
+        <div>
+          <div class="t">通用审核规则（预置）<span class="tag gold">系统预置</span><span class="tag">18 条规则</span></div>
+          <div class="hint" style="margin-top:6px">系统预置规则为内置标准规则，仅供查看；如需调整请「另存为自定义规则集」。</div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn">⎘ 另存为自定义规则集</button>
+        </div>
+      </div>
+      <div class="rm-filter">
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="chip active">全部 <span class="num">18</span></button>
+          <button class="chip"><span class="d" style="background:#ff4d4f"></span>严重 <span class="num">3</span></button>
+          <button class="chip"><span class="d" style="background:#faad14"></span>警告 <span class="num">7</span></button>
+          <button class="chip"><span class="d" style="background:#52c41a"></span>提示 <span class="num">8</span></button>
+        </div>
+        <div style="display:flex;gap:10px">
+          <input class="inp" style="width:220px" placeholder="搜索规则名称或说明" />
+          <select class="sel" style="width:150px"><option>全部类别</option><option>完整性</option><option>一致性</option><option>规范性</option><option>合规性</option></select>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="rc" style="--rm-accent:#ff4d4f"><div class="top"><div class="nm">资质证书有效期核查</div><span class="tag red">严重</span></div><div class="rc-tags" style="display:flex;gap:6px"><span class="tag">完整性</span><span class="tag blue">需法规依据</span></div><div class="ds">核查营业执照、资质证书是否在有效期内，是否触发否决。</div><div class="ft">审核要点 3 条</div></div>
+        <div class="rc" style="--rm-accent:#faad14"><div class="top"><div class="nm">金额数值一致性</div><span class="tag" style="background:#fff7e6;color:#d48806">警告</span></div><div class="rc-tags" style="display:flex;gap:6px"><span class="tag">一致性</span></div><div class="ds">报价大写与小写、分项合计与总价是否一致，是否存在算术错误。</div><div class="ft">审核要点 2 条</div></div>
+        <div class="rc" style="--rm-accent:#52c41a"><div class="top"><div class="nm">错别字与表述规范</div><span class="tag green">提示</span></div><div class="rc-tags" style="display:flex;gap:6px"><span class="tag">规范性</span></div><div class="ds">标注常见错别字与不规范表述，支持用户反馈沉淀忽略词库。</div><div class="ft">审核要点 1 条</div></div>
+        <div class="rc" style="--rm-accent:#1677ff"><div class="top"><div class="nm">合规性条款符合性</div><span class="tag red">严重</span></div><div class="rc-tags" style="display:flex;gap:6px"><span class="tag">合规性</span><span class="tag blue">需法规依据</span></div><div class="ds">对照规范性文件，审查文件是否存在触发否决的情形。</div><div class="ft">审核要点 4 条</div></div>
+      </div>
+    </section>
+  </div>
+</section>
+
+<!-- 审核历史 -->
+<section id="view-history" class="rm-page hidden">
+  <div class="rm-topbar">
+    <div>
+      <div class="rm-title"><span class="i">🕘</span>审核历史</div>
+      <div class="rm-sub">所有提交的任务在此留存，可查看详情、取消进行中任务或删除记录</div>
+    </div>
+  </div>
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3 style="margin:0">历史任务 <span class="tag">2</span></h3>
+      <button class="mini-btn danger" onclick="alert('清空全部历史（不可恢复）')">清空</button>
+    </div>
+    <div class="task-list">
+      <div class="task-row" onclick="openDetail('T-1024')">
+        <div class="top">
+          <span class="tag green">已完成</span>
+          <b style="font-size:13px">多文件审核</b>
+          <span class="tag" style="background:#f6ffed;color:#389e0d">得分 92</span>
+        </div>
+        <div class="meta">XX项目招标文件.pdf、XX公司投标文件.docx · 2026-08-12 19:20 · 规则组：完整性组/一致性组 · 知识库检索 5 次</div>
+        <div class="bar"><i style="width:100%"></i></div>
+        <div class="act">
+          <button class="mini-btn" onclick="event.stopPropagation();openDetail('T-1024')">查看详情</button>
+          <button class="mini-btn danger" onclick="event.stopPropagation();alert('删除任务记录')">删除</button>
+        </div>
+      </div>
+      <div class="task-row" onclick="openDetail('T-1031')">
+        <div class="top">
+          <span class="tag blue">进行中</span>
+          <b style="font-size:13px">多文件审核</b>
+          <span class="tag">联网搜索开启</span>
+        </div>
+        <div class="meta">XX公司投标文件.docx · 2026-08-12 21:30 · 规则组：完整性组/一致性组/规范性组</div>
+        <div class="bar"><i style="width:45%"></i></div>
+        <div class="act">
+          <button class="mini-btn" onclick="event.stopPropagation();openDetail('T-1031')">查看详情</button>
+          <button class="mini-btn danger" onclick="event.stopPropagation();alert('取消任务')">取消</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 反馈与训练数据 -->
+<section id="view-feedback" class="rm-page hidden">
+  <div class="rm-topbar">
+    <div>
+      <div class="rm-title"><span class="i">📊</span>反馈与训练数据</div>
+      <div class="rm-sub">汇集所有用户反馈标注，沉淀错别字忽略词库，并支持导出为模型调优训练数据</div>
+    </div>
+  </div>
+  <div class="stat-grid">
+    <div class="stat"><div class="v" style="color:#1668dc">128</div><div class="l">反馈总数</div></div>
+    <div class="stat"><div class="v" style="color:#52c41a">96</div><div class="l">采纳</div></div>
+    <div class="stat"><div class="v" style="color:#ff4d4f">32</div><div class="l">不采纳</div></div>
+    <div class="stat"><div class="v" style="color:#722ed1">14</div><div class="l">活跃过滤规则</div></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <div class="fb-tabs">
+      <div class="fb-tab active" onclick="fbTab(this,'training')">🗄 训练数据集（128）</div>
+      <div class="fb-tab" onclick="fbTab(this,'validation')">🔍 错别字校验集（26）</div>
+      <div class="fb-tab" onclick="fbTab(this,'filters')">⏹ 过滤规则（14）</div>
+    </div>
+
+    <div class="fb-pane active" id="pane-training">
+      <div class="toolbar">
+        <select class="sel" style="width:140px"><option>全部判定</option><option>采纳</option><option>不采纳</option></select>
+        <span style="font-size:13px">仅错别字</span>
+        <button class="switch" onclick="this.classList.toggle('on')"></button>
+        <input class="inp" style="width:220px" placeholder="搜索结论/原文/错字" />
+        <button class="btn primary" onclick="alert('已导出 feedback_training_data_...jsonl（Blob 下载）')">⬇ 导出 JSONL</button>
+      </div>
+      <table class="fp">
+        <thead><tr><th>判定</th><th>规则</th><th>结论 / 原文识别</th><th>时间</th></tr></thead>
+        <tbody>
+          <tr><td><span class="tag green">采纳</span></td><td>资质证书有效期核查</td><td>营业执照已过期，建议补充最新执照</td><td style="color:#8f959e">2026-08-12 19:26</td></tr>
+          <tr><td><span class="tag red">不采纳</span></td><td>错别字与表述规范 <span class="tag" style="background:#f9f0ff;color:#722ed1;margin-left:4px">错别字</span></td><td>错别字「投表」→「投标」 <span style="color:#cf1322">不采纳原因：此处为专业术语</span></td><td style="color:#8f959e">2026-08-12 19:28</td></tr>
+          <tr><td><span class="tag green">采纳</span></td><td>金额数值一致性</td><td>分项合计与总价一致，无算术错误</td><td style="color:#8f959e">2026-08-11 10:12</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="fb-pane" id="pane-validation">
+      <table class="fp">
+        <thead><tr><th>错字</th><th>正字</th><th>规则</th><th style="text-align:center">状态</th><th>原文结论</th></tr></thead>
+        <tbody>
+          <tr><td><span class="tag" style="background:#f9f0ff;color:#722ed1">投表</span></td><td>投标</td><td>错别字与表述规范</td><td style="text-align:center"><span class="tag">待判定</span></td><td>检测到错别字「投表」→「投标」</td></tr>
+          <tr><td><span class="tag" style="background:#f9f0ff;color:#722ed1">签定</span></td><td>签订</td><td>错别字与表述规范</td><td style="text-align:center"><span class="tag green">已采纳</span></td><td>错别字「签定」→「签订」</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="fb-pane" id="pane-filters">
+      <table class="fp">
+        <thead><tr><th>错字</th><th>正字</th><th>不采纳原因</th><th style="text-align:center">自动跳过</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr><td><span class="tag" style="background:#f9f0ff;color:#722ed1">投表</span></td><td>投标</td><td>专业术语，非错别字</td><td style="text-align:center"><span class="tag blue">7</span></td><td><button class="mini-btn danger" onclick="alert('已停用该过滤规则，后续重新校验该错别字')">停用</button></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- 任务详情抽屉（含逐条反馈） -->
+<div class="scrim" id="detailScrim" onclick="closeDetail()"></div>
+<aside class="drawer" id="detailDrawer">
+  <div class="drawer-head">
+    <div class="drawer-title">任务详情 · <span id="dId">T-1024</span></div>
+    <button class="btn" onclick="closeDetail()">关闭</button>
+  </div>
+  <div class="drawer-body">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <span class="tag green">已完成</span><span class="tag">得分 92</span><span class="tag blue">知识库检索 5</span>
+    </div>
+    <div class="hint" style="font-size:13px;line-height:1.8;margin-bottom:12px">
+      创建：2026-08-12 19:20 · 结束：19:26<br/>
+      规则组：完整性组 / 一致性组 · 文件：2 份<br/>
+      附加要求：重点核查金额一致性与签署有效期
+    </div>
+    <div class="sec-h">审核发现（逐条可反馈）</div>
+
+    <div class="find">
+      <div class="h"><b style="font-size:14px">① 资质证书有效期核查</b><span class="tag red">严重</span></div>
+      <div class="body">营业执照有效期至 2025-12-31，已过期；建议补充最新营业执照，否则可能被否决。</div>
+      <div class="fb-inline">
+        <button class="mini-btn" onclick="markFb(this,'采纳')">采纳</button>
+        <button class="mini-btn danger" onclick="markFb(this,'不采纳')">不采纳</button>
+      </div>
+    </div>
+
+    <div class="find">
+      <div class="h"><b style="font-size:14px">② 错别字与表述规范</b><span class="tag green">提示</span><span class="tag" style="background:#f9f0ff;color:#722ed1">错别字</span></div>
+      <div class="body">检测到错别字「投表」→ 应为「投标」。</div>
+      <div class="fb-inline">
+        <button class="mini-btn" onclick="markFb(this,'采纳')">采纳</button>
+        <button class="mini-btn danger" onclick="markTypo(this)">不采纳 → 记入忽略词库</button>
+      </div>
+      <div id="typoBox" class="hidden" style="margin-top:8px">
+        <input class="fb-input" placeholder="人工审核意见：例如「此处为专业术语，非错别字」" />
+        <button class="btn primary" style="margin-top:8px" onclick="alert('已沉淀到忽略词库，后续同类提示自动过滤（去噪）')">确认忽略</button>
+      </div>
+    </div>
+
+    <div class="find">
+      <div class="h"><b style="font-size:14px">③ 金额数值一致性</b><span class="tag" style="background:#fff7e6;color:#d48806">警告</span></div>
+      <div class="body">分项合计与总价一致，未发现算术错误。</div>
+      <div class="fb-inline">
+        <button class="mini-btn" onclick="markFb(this,'采纳')">采纳</button>
+        <button class="mini-btn danger" onclick="markFb(this,'不采纳')">不采纳</button>
+      </div>
+    </div>
+  </div>
+</aside>
+
+<!-- 系统配置抽屉（仅顶栏齿轮触发，单一入口） -->
+<div class="scrim" id="scrim" onclick="closeDrawer()"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <div class="drawer-title">系统配置</div>
+    <div style="display:flex;gap:8px">
+      <button class="btn" onclick="resetSys()">恢复默认</button>
+      <button class="btn primary" onclick="saveSys()">保存</button>
+    </div>
+  </div>
+  <div class="drawer-body">
+
+    <div class="sec">
+      <div class="sec-h">大模型</div>
+      <div class="field"><label>服务地址 <button class="link-btn" onclick="test('llm')">测试</button> <span class="test-tag load hidden" id="t-llm">测试中…</span></label>
+        <input class="inp" value="http://223.111.149.152:8000"></div>
+      <div class="row2">
+        <div class="field"><label>模型名称</label><input class="inp" value="/model"></div>
+        <div class="field"><label>API Key</label><input class="inp" type="password" value=""></div>
+      </div>
+      <div class="row2">
+        <div class="field"><label>超时(秒)</label><input class="inp" value="300"></div>
+        <div class="field"><label>温度</label><input class="inp" value="0.2"></div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-h">OCR 服务</div>
+      <div class="field"><label>服务地址 <button class="link-btn" onclick="test('ocr')">测试</button> <span class="test-tag load hidden" id="t-ocr">测试中…</span></label>
+        <input class="inp" value="http://223.111.149.152:8090"></div>
+      <div class="row2">
+        <div class="field"><label>接口路径</label><input class="inp" value="/tuling/uocr/v2/recognize"></div>
+        <div class="field"><label>超时(秒)</label><input class="inp" value="60"></div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-h">知识库服务</div>
+      <div class="field"><label>服务地址 <button class="link-btn" onclick="test('kb')">测试</button> <span class="test-tag load hidden" id="t-kb">测试中…</span></label>
+        <input class="inp" value="http://localhost:8000"></div>
+      <div class="field"><label>知识库</label>
+        <select class="sel"><option>通用法规库（128 篇文档）</option><option>行业资质库（42 篇文档）</option><option selected>— 先点「测试」加载列表 —</option></select></div>
+      <div class="field"><label>知识库 API 密钥</label><input class="inp" type="password" placeholder="可选，鉴权令牌"></div>
+      <div class="opt"><button class="switch on" onclick="this.classList.toggle('on')"></button><div class="lb">启用知识库</div>
+        <span class="tag" style="margin-left:8px">最大检索 5</span><span class="tag">超时 300s</span></div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-h">联网搜索（可选）</div>
+      <div class="opt"><button class="switch" onclick="this.classList.toggle('on')"></button><div class="lb">启用联网搜索</div></div>
+      <div class="field"><label>搜索 API</label>
+        <select class="sel"><option>Tavily Search</option><option>Bing Web Search</option><option>Serper (Google)</option></select></div>
+      <div class="field"><label>API 密钥 <button class="link-btn" onclick="test('ws')">测试</button> <span class="test-tag load hidden" id="t-ws">测试中…</span></label>
+        <input class="inp" type="password" placeholder="输入API密钥"></div>
+      <div class="row2">
+        <div class="field"><label>最大结果数</label><input class="inp" value="5"></div>
+        <div class="field"><label>超时(秒)</label><input class="inp" value="30"></div>
+      </div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-h">审核参数</div>
+      <div class="field"><label>单文件最大字数</label><input class="inp" value="50000"></div>
+    </div>
+
+    <p class="hint" style="margin-top:16px">配置保存在后端本地文件，重启后仍生效；也可用环境变量 <code>BCR_*</code> 覆盖。</p>
+  </div>
+  <div class="drawer-foot">
+    <button class="btn" onclick="closeDrawer()">取消</button>
+    <button class="btn primary" onclick="saveSys()">保存</button>
+  </div>
+</aside>
+
+<script>
+  var FT_GROUPS = {
+    '招标文件':['完整性组','合规性组'],
+    '投标文件':['完整性组','一致性组','规范性组','合规性组'],
+    '合同协议':['一致性组','合规性组'],
+    '资质证明':['完整性组'],
+    '通用文档':['规范性组'],
+  };
+  function go(p){
+    ['wb','filetypes','rulegroups','rules','history','feedback'].forEach(function(id){
+      document.getElementById('view-'+id).classList.toggle('hidden', id!==p);
+    });
+    closeDrawer();
+    document.querySelectorAll('.pill').forEach(b=>b.classList.toggle('active', b.dataset.p===p));
+    window.scrollTo(0,0);
+  }
+  function openDrawer(){document.getElementById('scrim').classList.add('open');document.getElementById('drawer').classList.add('open');}
+  function closeDrawer(){document.getElementById('scrim').classList.remove('open');document.getElementById('drawer').classList.remove('open');}
+  function openDetail(id){document.getElementById('dId').textContent=id;document.getElementById('detailScrim').classList.add('open');document.getElementById('detailDrawer').classList.add('open');}
+  function closeDetail(){document.getElementById('detailScrim').classList.remove('open');document.getElementById('detailDrawer').classList.remove('open');}
+  function markFb(btn,type){var p=btn.parentElement;p.querySelectorAll('button').forEach(function(b){b.disabled=true;});var tag=document.createElement('span');tag.className='tag '+(type==='采纳'?'green':'red');tag.textContent='已'+type;p.appendChild(tag);}
+  function markTypo(btn){document.getElementById('typoBox').classList.remove('hidden');btn.disabled=true;}
+  function fbTab(tab,key){document.querySelectorAll('.fb-tab').forEach(function(t){t.classList.toggle('active',t===tab);});['training','validation','filters'].forEach(function(k){document.getElementById('pane-'+k).classList.toggle('active',k===key);});}
+  function test(t){
+    var el=document.getElementById('t-'+t); el.classList.remove('hidden'); el.className='test-tag load'; el.textContent='测试中…';
+    setTimeout(function(){el.className='test-tag ok';el.textContent='连接正常';},700);
+  }
+  function saveSys(){closeDrawer(); alert('配置已保存（持久化到后端）');}
+  function resetSys(){alert('已恢复默认配置');}
+  function selSet(el){el.parentElement.querySelectorAll('.rm-set').forEach(function(s){s.classList.toggle('active',s===el);});}
+
+  /* 规则组多选 */
+  function toggleGrp(chip){ chip.classList.toggle('active'); }
+  /* 自动根据文件类型匹配规则组（系统不自动分类文件，仅依手动指定的类型匹配） */
+  function autoMatchOn(){ return document.getElementById('autoMatch').classList.contains('on'); }
+  function recomputeGroups(){
+    var types = Array.prototype.slice.call(document.querySelectorAll('.ft-type-select')).map(function(s){return s.value;});
+    var set = {};
+    types.forEach(function(t){ (FT_GROUPS[t]||[]).forEach(function(g){ set[g]=true; }); });
+    document.querySelectorAll('#grpSelect .grp-chip').forEach(function(c){
+      c.classList.toggle('active', !!set[c.dataset.g]);
+    });
+    var note = document.getElementById('autoNote');
+    var keys = Object.keys(set);
+    note.classList.toggle('hidden', keys.length===0);
+    note.textContent = keys.length ? ('已依据所选文件类型自动匹配规则组：'+keys.join(' / ')+'，可在下方手动增删。') : '当前文件类型未关联任何规则组，请手动选择或到「文件类型配置」关联。';
+  }
+  function toggleAuto(){
+    var sw = document.getElementById('autoMatch'); sw.classList.toggle('on');
+    var on = sw.classList.contains('on');
+    document.getElementById('grpSelect').classList.toggle('locked', on);
+    if(on) recomputeGroups();
+  }
+  function fileTypeChanged(){ if(autoMatchOn()) recomputeGroups(); }
+</script>
+</body>
+</html>

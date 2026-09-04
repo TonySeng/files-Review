@@ -1,0 +1,70 @@
+{
+  "status": "ready",
+  "rule_count": 5,
+  "stats": {
+    "source_chars": 508,
+    "chunks": 1,
+    "chunks_done": 1,
+    "raw_rules": 5,
+    "dedup_removed": 0,
+    "kept": 5,
+    "truncated": 0,
+    "failed_chunks": 0,
+    "elapsed_sec": 137.5,
+    "split_mode": "article"
+  },
+  "warnings": [],
+  "consistency_false_positive": [],
+  "sample_rules": [
+    {
+      "name": "投标人不得以低于成本的报价竞标",
+      "severity": "critical",
+      "category": "commercial",
+      "legal_basis": "第三十三条：投标人不得以低于成本的报价竞标",
+      "checkpoints": [
+        "核对投标报价是否低于同期同类项目平均成本或行业成本线",
+        "查验投标人是否提供成本构成说明文件以证明报价合理性"
+      ]
+    },
+    {
+      "name": "投标文件须响应招标文件实质性要求",
+      "severity": "critical",
+      "category": "technical",
+      "legal_basis": "第二十六条：投标文件应当对招标文件提出的实质性要求和条件作出响应",
+      "checkpoints": [
+        "逐项比对投标文件与招标文件中的实质性要求条款是否一一对应",
+        "检查投标文件中是否存在对实质性要求的否定、保留或条件性响应"
+      ]
+    },
+    {
+      "name": "投标人须具备法定或招标文件规定的资格条件",
+      "severity": "critical",
+      "category": "qualification",
+      "legal_basis": "第二十六条：国家有关规定对投标人资格条件或者招标文件对投标人资格条件有规定的，投标人应当具备规定的资格条件",
+      "checkpoints": [
+        "核验投标人提供的资质证书是否在有效期内且符合招标文件要求等级",
+        "比对投标人提供的业绩证明、人员资格文件是否满足招标文件资格条款"
+      ]
+    },
+    {
+      "name": "中标后合同不得背离招标文件与投标文件实质性内容",
+      "severity": "critical",
+      "category": "legal",
+      "legal_basis": "第四十六条：招标人和中标人不得再行订立背离合同实质性内容的其他协议",
+      "checkpoints": [
+        "比对中标后签订的合同文本与招标文件、中标人投标文件的关键条款（如价格、工期、技术标准）是否一致",
+        "检查是否存在补充协议或附件对合同实质性内容作出变更"
+      ]
+    },
+    {
+      "name": "中标人应于30日内签订书面合同",
+      "severity": "major",
+      "category": "format",
+      "legal_basis": "第四十六条：招标人和中标人应当自中标通知书发出之日起三十日内，按照招标文件和中标人的投标文件订立书面合同",
+      "checkpoints": [
+        "核查中标通知书发出日期与合同签订日期的时间差是否超过30日",
+        "查验合同签署文件是否为书面形式并加盖双方公章"
+      ]
+    }
+  ]
+}

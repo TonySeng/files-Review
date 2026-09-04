@@ -1,0 +1,20 @@
+# 根构建上下文忽略规则（前端/后端共享）
+.git/
+**/__pycache__/
+*.pyc
+*.pyo
+backend/.pytest_cache/
+backend/uploads/
+# 关键：禁止把运行时数据（含 feedback.db / reviewdata.db / app.db / users.json 等）打进镜像！
+# 否则本地 `docker compose build` 会把项目根 backend/data/ 下的测试/反馈数据一并 COPY 进镜像，
+# 一旦该镜像流转到别的环境即造成数据泄漏。数据只应存在于运行时挂载卷（br_data / backend_data）。
+backend/data/
+backend/exports/
+# 不把含密钥的运行时配置打进镜像，统一用 BCR_* 环境变量注入
+backend/runtime_config.json
+backend/rules_store.json
+frontend/node_modules/
+# 注：dist 由本地 `npm run build` 预生成，需打进前端镜像，故不忽略
+frontend/.vite/
+deliverables/
+tests/

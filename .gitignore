@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# 运行期生成
+backend/uploads/
+backend/runtime_config.json
+backend/rules_store.json
+backend/data/
+*.log
+
+# 前端
+node_modules/
+dist/
+
+# 测试产物
+tests/fixtures/
+tests/screenshots/
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 部署包（由 make-deploy-package.sh 生成，可再生产物不入库）
+bidding-review-deploy/
+*.tar.gz
+
+# 前端构建历史与临时产物
+frontend/dist_old*/
+frontend/_dist_bak_*/
+frontend/tmp/
+frontend/tsconfig.tsbuildinfo
+_build_trash/
+
+# 开发调试遗留（截图/临时脚本/日志/复现产物）
+_*.png
+_*.js
+_*.cjs
+_*.log
+_*.txt
+_build_trash
+diag_tmp.py
+rerun_tid.txt
+
+# WorkBuddy 工作区（项目记忆，非代码）
+.workbuddy/

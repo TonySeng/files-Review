@@ -1,0 +1,52 @@
+# 文档合规审核工具 — 本地 Docker Desktop 编排
+# 构建上下文为项目根目录；前后端同源经 nginx 反代 /api，与本地 vite 开发代理行为一致。
+#
+# 外部服务地址说明：
+#   - 千问 LLM / OCR 使用内网 IP（223.111.149.152），容器内可直接访问
+#   - 知识库部署在宿主机 localhost:8000（llm-docqa-backend），容器内须用
+#     host.docker.internal 才能访问宿主机，故以 BCR_KB_BASE_URL 覆盖
+#     runtime_config.json 中写死的 http://localhost:8000
+#
+# 使用：
+#   docker compose up -d --build
+#  访问前端：http://localhost:9090   （等同本地开发 http://localhost:5173）
+#  健康检查：http://localhost:9100/api/health
+#  注：原 8080/8100 被 Windows 端口保留段(8078-8177)占用，已改用 9090/9100。
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: bidding-review-backend:local
+    # 注意：不要在 environment 里硬编码 BCR_LLM_BASE_URL / BCR_KB_BASE_URL 等地址。
+    # 这些 BCR_* 环境变量优先级最高，会覆盖 UI/DB 中通过「服务配置」保存的设置，
+    # 导致切换模型/修改知识库地址在界面上"不生效"（曾在切到 DeepSeek 时踩坑）。
+    # 现统一以数据库（app.db）/ runtime_config.json 中用户保存的值为准；
+    # DEFAULTS 已保留原始千问/OCR 地址作为兜底。
+    # 让容器能通过宿主主机名访问宿主机上的知识库服务
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    expose:
+      - "8100"
+    ports:
+      - "9100:8100"
+    # 持久化配置数据库（SQLite），跨容器重建保留，避免「重启即丢失」
+    volumes:
+      - backend_data:/app/backend/data
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    image: bidding-review-frontend:local
+    depends_on:
+      - backend
+    ports:
+      - "9090:80"
+    restart: unless-stopped
+
+# 命名卷：保存后端配置数据库，容器重建/重拉镜像后配置不丢失
+volumes:
+  backend_data:

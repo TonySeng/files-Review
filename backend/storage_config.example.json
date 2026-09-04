@@ -1,0 +1,46 @@
+{
+  "_说明": "统一数据存储配置样例。复制为 backend/data/storage_config.json（或用环境变量 BCR_STORAGE_CONFIG 指定路径）后修改即可生效；热加载器默认每 2 秒轮询文件变更，无需重启。",
+
+  "structured": {
+    "_说明": "结构化数据驱动：sqlite（默认，JSON 集合 + 本地 .db，零迁移）| mysql | postgresql。切换到外部数据库需 pip install pymysql / psycopg[binary]，且填齐连接信息。切换时系统自动把当前内存态写入新后端。",
+    "driver": "sqlite",
+
+    "sqlite": {
+      "_说明": "data_dir：JSON 集合文件与内置 .db 的存放目录",
+      "data_dir": "backend/data"
+    },
+
+    "mysql": {
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "bidding",
+      "password": "CHANGE_ME",
+      "database": "bidding_review",
+      "charset": "utf8mb4",
+      "connect_timeout": 10
+    },
+
+    "postgresql": {
+      "host": "127.0.0.1",
+      "port": 5432,
+      "user": "bidding",
+      "password": "CHANGE_ME",
+      "database": "bidding_review",
+      "connect_timeout": 10
+    }
+  },
+
+  "files": {
+    "_说明": "文件数据存储。当前支持 local 驱动；base_dir 为上传文件根目录（上传文件落 base_dir/uploads）。修改 base_dir 热生效：新上传写入新目录，旧目录文件需手动搬迁。",
+    "driver": "local",
+    "local": {
+      "base_dir": "backend/data"
+    }
+  },
+
+  "hot_reload": {
+    "_说明": "配置文件热加载：enabled=false 关闭自动生效（仍可 POST /api/settings/storage/reload 手动触发）",
+    "enabled": true,
+    "interval_seconds": 5
+  }
+}

@@ -4,14 +4,45 @@
 
 ## 功能特性
 
+### 审核核心
+
 - **多文件一并审核**：支持同时上传招标文件、投标文件、报价表等多个附件，按角色标注后做交叉比对
 - **自主知识库检索**：模型自行判断哪些规则需要法规依据（如保证金上限、投标有效期下限、禁止投标情形），按需检索本地知识库，不需要的规则直接跳过，避免无效调用
 - **招标要求自动提取**：标注招标文件后，自动提取限价、保证金、资质、★条款等约束项，作为投标文件的比对基准
-- **规则分层与场景适配**：内置 37 条规则分为投标审核（17 条 BID_RULES）、招标审核（12 条 TENDER_RULES）、通用质量（8 条 GENERAL_RULES）三层，根据审核模式自动应用对应规则集；支持规则级过滤、新增规则与自定义规则集
+- **规则分层与场景适配**：内置规则分为投标审核、招标审核、通用质量三层，根据审核模式自动应用对应规则集；支持规则级过滤、新增规则与自定义规则集
 - **跨文件一致性核查**：检出投标总价、工期、人员、证书编号等信息在不同文件间的矛盾
+- **确定性结构化规则**：金额差值比对类规则不走大模型，本地精确计算并锁定结论
 - **扫描件 OCR**：PDF 逐页检测，文本层缺失的扫描页自动走 OCR 识别
-- **服务地址可配置**：大模型、OCR、知识库地址均可在界面配置并一键测试连通性
-- **流式审核过程**：SSE 实时推送阶段进度、知识库检索轨迹与逐条结论
+- **流式审核过程**：SSE 实时推送阶段进度、知识库检索轨迹与逐条结论；终端风格过程面板（审核与法规解析共用同一组件）
+
+### 法规挖掘（法规 → 审核规则）
+
+- 上传法律法规文件（txt/pdf/docx），系统自动切分条款块，由大模型**分块并行抽取可核查的审核规则**，生成临时规则集后可用于审核
+- 抽取调用走 **SSE 流式输出**：读超时只约束「增量空窗」而非总解码时长，长法规生成不会被误杀
+- 全程**实时进度面板**：逐文件字数 → 切分方式与块数 → 每块开始/完成（耗时+条数）→ 合并去重 → 完成，支持「后台运行」（关弹窗进度不断，规则集卡片可回看日志）
+- 抽取后规则支持时效性校验（法规名称/文号/版本日期元数据）与按可核查性截断
+
+### Prompt 统一管理（管理员）
+
+- 系统全部 9 个 prompt 模板（审核 3 + 一致性 4 + 法规挖掘 2）收编为统一模板库，运行时按 key 动态渲染，**改 prompt 即时生效、无需改代码**
+- 版本管理：每次修改自动存版本，支持历史查看、任意版本回滚、双版本 diff 对比、一键重置内置默认
+- 测试验证：发布前可填入变量渲染预览，并支持**真实调用 LLM 验证效果**
+
+### 数据存储层（可配置热切换）
+
+- 统一配置文件 `backend/data/storage_config.json`（样例见 `backend/storage_config.example.json`）：
+  - **结构化数据**：`structured.driver` 支持 `sqlite`（默认，行为与历史一致）/ `mysql` / `postgresql`，含连接地址与账号凭据
+  - **文件数据**：`files.local.base_dir` 自定义上传文件根目录
+- **修改配置文件后系统自动热生效**（秒级轮询），切换结构化数据/文件数据存储方式无需改代码、无需重启；切换时自动把各模块内存态与旧后端数据迁写到新后端，不丢数据；配置错误时 fail-safe 沿用旧配置
+- 存储层与业务逻辑完全解耦：集合存储、关系库（含 SQLite→MySQL/PG 方言翻译）、文件目录三类抽象，业务模块只调统一 API
+- 管理界面「服务配置」抽屉含**数据存储状态卡**（当前驱动/后端/目录/热加载状态）与「立即重载」按钮；状态 API：`GET /api/settings/storage`
+
+### 管理与配置界面
+
+- 功能菜单按业务分组（审核业务 / 配置管理 / 系统管理），全项配 icon
+- API Key 管理并入「用户与密钥管理」页（Tab 切换），取消独立菜单
+- 法规规则管理页：法规规则集列表 + 详情抽屉（来源法规元数据 / 规则增删改启停 / 生成过程日志回看）
+- SwaggerUI（`/api/docs`）全端点中文 summary + 完整鉴权调用说明
 
 ## 技术栈
 
@@ -20,9 +51,10 @@
 | 前端 | React 18 + TypeScript + Vite + Ant Design 5 |
 | 后端 | Python 3.13 + FastAPI + httpx（全异步） |
 | 文档解析 | PyMuPDF（PDF）、python-docx（Word）、openpyxl（Excel） |
-| 大模型 | 千问 80B（vLLM 部署，OpenAI 兼容协议） |
+| 大模型 | 千问 80B（vLLM 部署，OpenAI 兼容协议；支持流式） |
 | OCR | 图聆云图文识别 |
 | 知识库 | LLM-Docqa（SSE 流式问答） |
+| 数据存储 | SQLite（默认）/ MySQL / PostgreSQL（存储层可配置热切换） |
 
 ## 外部服务
 
@@ -47,7 +79,7 @@ cd ..
 python -m uvicorn backend.main:app --host 127.0.0.1 --port 8100
 ```
 
-接口文档：http://127.0.0.1:8100/api/docs
+接口文档：http://127.0.0.1:8100/api/docs （全部端点含中文说明与鉴权示例）
 
 ### 前端
 
@@ -59,6 +91,13 @@ npm run dev
 
 访问 http://localhost:5173（已配置 `/api` 代理到后端 8100 端口）。
 
+### Docker 一键启动
+
+```bash
+docker-compose build && docker-compose up -d
+# 前端 http://localhost:9090 ，后端 http://localhost:9100
+```
+
 ### 首次使用
 
 1. 打开「服务配置」，逐项测试三个服务连通性
@@ -66,6 +105,8 @@ npm run dev
 3. **选择审核模式**：根据场景选择「投标文档审核」、「招标文档审核」或「通用文档审核」
 4. 上传文件，把招标文档的角色标为「招标文档」，投标文档标为「投标文档」
 5. 选择审核规则（系统已根据模式加载对应规则集），点击「开始审核」
+
+> 需要基于某部法规生成专属规则？在规则面板选择「法规临时规则」→ 上传法规文件 →「开始生成」，过程实时可见（约 5 分钟/万字），完成后可直接用于审核。
 
 ## 使用说明
 
@@ -94,15 +135,11 @@ npm run dev
 
 工具内置三层规则体系，根据审核场景自动应用对应规则集：
 
-| 模式 | 规则组成 | 场景 |
-|---|---|---|
-| **投标审核（bid）** | 17 条 BID_RULES + 8 条 GENERAL_RULES = 25 条 | 审核投标文件对招标要求的响应性 |
-| **招标审核（tender）** | 12 条 TENDER_RULES + 8 条 GENERAL_RULES = 20 条 | 审核招标文件自身的合规性与完备性 |
-| **通用审核（general）** | 8 条 GENERAL_RULES | 纯文档质量审核，不涉及招投标业务规则 |
-
-- **BID_RULES**：资格性（营业执照、资质证书、人员、业绩、信用）、商务（保证金、报价、有效期、付款）、技术响应、格式要求、一致性核查
-- **TENDER_RULES**：文件完整性、项目范围、资格条件、技术规格、评分标准、保证金要求、时间安排、限价合规性、付款条款、合同条款、澄清机制、内部一致性
-- **GENERAL_RULES**：错别字、语义通顺、术语规范、数字格式、表格规范、目录页码、引用准确、附件齐全
+| 模式 | 场景 |
+|---|---|
+| **投标审核（bid）** | 审核投标文件对招标要求的响应性（资格、商务、技术、格式） |
+| **招标审核（tender）** | 审核招标文件自身的合规性与完备性 |
+| **通用审核（general）** | 纯文档质量审核（错别字、语义、术语、格式），不涉及招投标业务规则 |
 
 **模式切换**：页面顶部「审核模式」区域可切换三种模式，切换后规则面板自动加载对应规则集。审核时可通过规则面板进一步过滤具体规则ID（如只审核资格性+报价相关的 5 条规则）。
 
@@ -116,33 +153,45 @@ npm run dev
 
 ```
 ├── backend/
-│   ├── main.py                  # FastAPI 入口
+│   ├── main.py                  # FastAPI 入口（含存储层热加载接线）
 │   ├── config.py                # 配置管理（环境变量 + 运行时热更新 + 持久化）
+│   ├── storage/                 # ★ 可配置数据存储层
+│   │   ├── settings.py          #   统一配置加载/校验/热轮询
+│   │   ├── registry.py          #   后端单例 + 切换迁移 + 状态快照
+│   │   ├── collections.py       #   集合后端（json/sqlite/mysql/pg）
+│   │   ├── relational.py        #   关系库连接工厂 + 方言翻译
+│   │   └── hot.py               #   lifespan 热加载循环
+│   ├── storage_config.example.json  # 存储配置样例
 │   ├── models/schemas.py        # API 数据模型
 │   ├── routers/
 │   │   ├── files.py             # 文件上传与管理
 │   │   ├── review.py            # 审核接口（SSE）
 │   │   ├── rules.py             # 规则集配置
-│   │   └── settings.py          # 服务地址配置与连通性测试
+│   │   ├── legalrules.py        # 法规挖掘与法规规则集
+│   │   ├── prompts.py           # Prompt 统一管理（版本/回滚/diff/测试）
+│   │   └── settings.py          # 服务配置 + 数据存储状态/重载
 │   └── services/
-│       ├── llm_client.py        # 千问 80B 客户端（含 JSON 稳健解析）
-│       ├── ocr_client.py        # OCR 客户端
-│       ├── kb_client.py         # 知识库客户端（SSE 聚合）
-│       ├── doc_parser.py        # 文档解析（扫描页自动 OCR）
-│       ├── file_store.py        # 文件存储与解析缓存
-│       ├── rules_store.py       # 内置规则 + 自定义规则集持久化
-│       ├── prompts.py           # 审核提示词模板
-│       └── review_engine.py     # 审核编排引擎
+│       ├── llm_client.py        # 大模型客户端（重试/并发闸/流式选项）
+│       ├── legal_rules.py       # 法规挖掘（分块并行 + 流式抽取 + 实时日志）
+│       ├── prompt_store.py      # Prompt 模板库（9 内置模板 + 版本管理）
+│       ├── prompts.py           # 提示词 builder（从 prompt_store 动态渲染）
+│       ├── ocr_client.py / kb_client.py / doc_parser.py
+│       ├── file_store.py / task_store.py / rules_store.py
+│       └── review_engine.py     # 审核编排引擎（分批并行 + 分段校对）
 ├── frontend/
 │   └── src/
-│       ├── App.tsx
-│       ├── components/          # 文件、规则、进度、结果、配置面板
-│       ├── hooks/useReview.ts   # 审核流状态管理
+│       ├── App.tsx              # 分组菜单 + 视图路由
+│       ├── components/          # 文件、规则、进度（ProgressPanel 共用）、配置面板
+│       ├── pages/               # PromptManagement / LegalRulesManagement /
+│       │                        # UserManagement（含 API Key Tab）/ TaskDetail 等
 │       ├── services/api.ts      # API 客户端（含 SSE 读流）
 │       └── types/
-└── tests/
-    └── make_fixtures.py         # 生成含预埋缺陷的测试文件
+├── make-deploy-package.sh       # 生成 arm64 自包含部署包（final12）
+├── transfer-to-131.sh           # 传输到目标服务器（填 SERVER_IP）
+└── docker-compose.yml
 ```
+
+> 测试与调试脚本（`test_*.py`、`tests/` 等）按约定不入库，仅保留在本地。
 
 ## 审核流程
 
@@ -151,12 +200,12 @@ npm run dev
    ↓
 提取招标文件关键要求
    ↓
-规则分批送审（每批 4 条）
+规则分批送审（按规则逐条并行；校对类规则分段并行）
    ├─ 模型判断是否需要法规依据
    ├─ 需要 → 检索知识库 → 注入条文原文
    └─ 不需要 → 直接审核
    ↓
-跨文件一致性核查
+跨文件一致性核查（分段摘要 + 要素聚焦）
    ↓
 汇总评分与结论
    ↓
@@ -174,6 +223,8 @@ npm run dev
 
 ## 配置项
 
+### 业务配置
+
 界面「服务配置」可改，也可用环境变量 `BCR_<配置项大写>` 覆盖（优先级最高）：
 
 ```bash
@@ -181,23 +232,35 @@ export BCR_LLM_BASE_URL=http://223.111.149.152:8000
 export BCR_KB_ID=<知识库ID>
 export BCR_MAX_CHARS_PER_DOC=60000   # 单文件送审字数上限，超出保留首尾
 export BCR_KB_MAX_QUERIES=6          # 单批次知识库检索次数上限
+export BCR_LEGAL_CHUNK_CHARS=3000    # 法规挖掘单块字符数
+export BCR_LEGAL_MINING_TIMEOUT=420  # 单块抽取流式超时（秒）
+export BCR_LEGAL_MINING_CONCURRENCY=6
 ```
 
-配置持久化在 `backend/runtime_config.json`，自定义规则集在 `backend/rules_store.json`。
+业务配置持久化在 `backend/runtime_config.json`（SQLite app.db 优先级更高）。
+
+### 数据存储配置
+
+见「数据存储层」一节：配置文件 `backend/data/storage_config.json`（样例 `backend/storage_config.example.json`），修改后自动热生效；不建此文件 = 默认 SQLite，行为与历史完全一致。
 
 ## 已知限制
 
-- **工具调用降级**：当前 vLLM 服务未启用 `--enable-auto-tool-choice`，原生 function calling 不可用，工具已自动降级为「提示词规划」模式——先让模型规划需要检索的法规问题，再注入检索结果。功能等价，但多一次模型调用。服务端加上该启动参数后会自动切回原生模式。
+- **MySQL/PG 适配未经集成实测**：存储层的 MySQL/PostgreSQL 驱动为标准 SQL 实现，本环境无实例未做联调；切换外部数据库前请先在测试环境验证（PG 下 `INSERT OR REPLACE` 一处暂不支持，代码中会明确报错）
+- **切换文件目录不自动搬迁**：修改 `files.local.base_dir` 后，旧目录中已上传文件需手动迁移（系统会打警告日志）
+- **工具调用降级**：当前 vLLM 服务未启用 `--enable-auto-tool-choice`，原生 function calling 不可用，工具已自动降级为「提示词规划」模式。服务端加上该启动参数后会自动切回原生模式
 - **旧版 `.doc` 不支持**，需先转为 `.docx`
 - **单文件字数上限** 默认 6 万字，超出部分保留首尾（关键信息通常在开头须知与结尾承诺/签章处）
 - **OCR 页数上限** 单个 PDF 最多识别 30 个扫描页
-- **文件存储在内存**，后端重启后需重新上传
+- **文件与在途任务存储在内存**，后端重启后需重新上传（规则集/配置/审计等持久化数据不受影响）
 - 审核结论由大模型生成，**须经人工复核**后作为决策依据
+- **默认管理员账号为出厂预设**，上线前请务必修改密码
 
-## 测试
+## 部署（arm64 服务器）
 
 ```bash
-python tests/make_fixtures.py   # 生成含预埋缺陷的招标/投标/报价文件
+./make-deploy-package.sh        # 生成自包含部署包（含预构建前端 dist）
+./transfer-to-131.sh            # scp 传输（填 SERVER_IP）
+# 服务器内执行包内 ./deploy.sh（docker-compose v1）或 ./deploy-docker.sh（纯 docker）
 ```
 
-预埋缺陷包括：报价超最高限价、保证金金额不足且形式不符、投标有效期短于要求、缺 CMMI 认证、业绩数量不足、并发数不达标、等保等级不足、缺法定代表人授权委托书、跨文件投标总价矛盾（850 万 vs 860 万）。
+部署包自带 arm64 后端 Dockerfile（python:3.13-slim，纯 uvicorn，无 uvloop/httptools）与 nginx 前端镜像；数据由命名卷持久化，重启/重建不丢配置与任务。

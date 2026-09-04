@@ -48,3 +48,13 @@ rerun_tid.txt
 
 # WorkBuddy 工作区（项目记忆，非代码）
 .workbuddy/
+
+# 本地测试与调试脚本（不入库，文件保留在本地磁盘）
+test_*.py
+tests/
+backend_verify.py
+backend/_import_test.py
+backend/monitor_*.py
+backend/probe_*.py
+backend/smoke_*.py
+backend/e2e_verify.*

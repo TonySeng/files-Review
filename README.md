@@ -70,7 +70,7 @@
 | 千问 80B | `http://223.111.149.152:8000` | `POST /v1/chat/completions`，模型名 `/model` |
 | OCR | `http://223.111.149.152:8090` | `POST /tuling/uocr/v2/recognize`（multipart：`trackId`、`category`、`picFile`） |
 | OCR（百度，可选） | `https://aip.baidubce.com` | `POST /rest/2.0/ocr/v1/general_basic?access_token=...`（AK/SK 换 token，base64 表单） |
-| OCR（讯飞，可选） | `https://api.xf-yun.com` | `POST /v1/private/hh_ocr_recognize_doc`（通用文字识别 intsig，URL hmac-sha256 签名，base64 JSON） |
+| OCR（讯飞，可选） | `https://api.xf-yun.com` | `POST /v1/private/sf8e6aca1`（默认，通用文字识别中英文）/ `POST /v1/private/hh_ocr_recognize_doc`（intsig 52 语种），URL hmac-sha256 签名，base64 JSON |
 | 知识库 | `http://localhost:8000` | `POST /api/qa/ask`（SSE），`GET /api/knowledge-bases` |
 
 > 知识库需预先建立法规库并导入《招标投标法》《招标投标法实施条例》等文档。当前环境已有「招采法律法规」库（9 份文档）。
@@ -82,10 +82,17 @@
 >   高精度版将接口路径改为 `/rest/2.0/ocr/v1/accurate_basic`。密钥保存后脱敏回显，
 >   留空表示保持不变。
 > - **讯飞开放平台**：填入应用的 AppID / APIKey / APISecret（请求 URL 按 hmac-sha256
->   签名，服务器时钟偏差需小于 5 分钟；图片 base64 JSON 提交，≤4M）。支持印刷体与
->   手写体、52 种语种。注意业务级错误（如 11201 授权不足/日流控超限）包在 HTTP 500
->   中返回，系统已解析并给出中文提示；需在讯飞控制台为应用开通「通用文字识别
->   intsig」能力后方可调用。密钥保存后脱敏回显，留空表示保持不变。
+>   签名，服务器时钟偏差需小于 5 分钟；图片 base64 JSON 提交，≤4M）。默认走
+>   `sf8e6aca1`（中英文印刷+手写），把接口路径改为 `/v1/private/hh_ocr_recognize_doc`
+>   即切换 intsig 52 语种服务，请求体/响应按路径服务名自动适配。注意业务级错误
+>   （如 11201 授权不足/日流控超限）包在 HTTP 500 中返回，系统已解析并给出中文提示；
+>   需在讯飞控制台为应用开通对应「通用文字识别」能力后方可调用。密钥保存后脱敏回显，
+>   留空表示保持不变。
+>   ⚠️ **APIKey 与 APISecret 勿填反**：两者对调时讯飞仍能识别 APIKey（不会报
+>   apikey not found），但报 401 `HMAC signature` 不匹配。排查可用根目录
+>   `xfyun_ocr_probe.py` 直连讯飞验证（纯标准库）：
+>   `python xfyun_ocr_probe.py --app-id <APPID> --api-key <APIKey> --api-secret <APISecret>`。
+>   另：星火大模型的 APIPassword 与 OCR webapi 的 APIKey/APISecret 是两套独立凭证。
 
 ## 快速开始
 

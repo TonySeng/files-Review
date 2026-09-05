@@ -121,6 +121,9 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
       // 一并下发未保存的服务类型，支持「填完即测」，无需先保存
       const rawProvider = target === 'ocr' ? form.getFieldValue('ocr_provider') : undefined
       const ocrIsXfyun = rawProvider === 'xfyun'
+      // 大模型“先测后存”时需要把表单里的模型名一起带过去（默认基地址为本地 vLLM 用 /model，
+      // 切到讯飞星火等需显式填如 4.0Ultra），否则测试会用到已保存的旧模型名而误报 400。
+      const rawModel = target === 'llm' ? form.getFieldValue('llm_model') : undefined
       const rawSecret = target === 'ocr'
         ? form.getFieldValue(ocrIsXfyun ? 'ocr_xfyun_api_secret' : 'ocr_secret_key')
         : undefined
@@ -138,6 +141,7 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
         rawSecret && rawSecret !== '***' ? rawSecret : undefined,
         rawProvider || undefined,
         rawAppId && rawAppId !== '***' ? rawAppId : undefined,
+        rawModel && rawModel !== '***' ? rawModel : undefined,
       )
       setTests((prev) => ({ ...prev, [target]: { ok: res.ok, message: res.message } }))
       if (target === 'kb' && res.ok) {
@@ -288,7 +292,7 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
         </Form.Item>
         <Space size={10} style={{ width: '100%' }}>
           <Form.Item label="模型名称" name="llm_model" style={{ flex: 1, minWidth: 150 }}>
-            <Input placeholder="/model" />
+            <Input placeholder="/model（讯飞星火填 4.0Ultra 等）" />
           </Form.Item>
           <Form.Item
             label={

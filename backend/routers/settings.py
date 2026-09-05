@@ -95,6 +95,10 @@ async def test_connection(
                 overrides["ocr_secret_key"] = req.secret_key
     elif secret_key and req.api_key and req.api_key != MASKED:
         overrides[secret_key] = req.api_key
+    # 大模型名称：用户可能在保存前先在表单填好模型名（如讯飞星火 4.0Ultra）即测，
+    # 此时临时覆盖 llm_model，使“填完即测”能验证到正确的模型。
+    if req.target == "llm" and req.model and req.model != MASKED:
+        overrides["llm_model"] = req.model
     # 服务类型切换后未保存即测试：临时生效，避免用旧 provider 跑出一个误导性结果
     if req.target == "ocr" and req.provider:
         overrides["ocr_provider"] = req.provider

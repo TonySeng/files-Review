@@ -49,11 +49,20 @@ def _is_transient_llm_error(exc: Exception) -> bool:
 
 
 def _base_url() -> str:
-    """归一化 base_url：硅基流动(SiliconFlow)等地址自带 /v1，千问/DeepSeek 不带。
+    """归一化 base_url，兼容三种用户填法：
 
-    统一补齐且仅补一次，避免拼成 /v1/v1/chat/completions 导致 404。
+    - ``https://host/v1/chat/completions``  （从文档里直接粘了完整地址）
+    - ``https://host/v1``                    （只填到 /v1）
+    - ``https://host``                       （只填 host）
+
+    统一收敛为 ``https://host/v1``（不含末尾 ``/chat/completions``），
+    再由 :func:`_endpoint` 补上 ``/chat/completions``，避免拼成
+    ``/v1/chat/completions/v1/chat/completions`` 这类导致 404 的畸形地址。
     """
     base = (config.get("llm_base_url", "") or "").rstrip("/")
+    # 用户可能直接粘了完整端点，先剥掉末尾的 /chat/completions
+    if base.endswith("/chat/completions"):
+        base = base[: -len("/chat/completions")]
     if base.endswith("/v1"):
         return base
     return base + "/v1"
@@ -392,17 +401,50 @@ def parse_json(text: str) -> Any:
 
 
 async def test_connection() -> dict[str, Any]:
-    url = _base_url() + "/models"
+    """以一次最小对话请求探测连通性（兼容所有 OpenAI 协议实现，含讯飞星火）。
+
+    早期实现打 ``/v1/models`` 列表端点，但讯飞星火等部分提供方不实现
+    ``/models``，鉴权通过后会返回 404。改为直接发 ``/v1/chat/completions``，
+    能同时验证地址路径、鉴权与模型是否存在。
+    """
+    model = (config.get("llm_model") or "").strip()
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 8,
+        "temperature": 0.0,
+        "stream": False,
+    }
     try:
-        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
-            resp = await client.get(url, headers=_headers())
-        if resp.status_code >= 400:
-            body = (resp.text or "")[:200]
-            msg = f"HTTP {resp.status_code}"
-            if body:
-                msg += f": {body}"
-            return {"ok": False, "message": msg}
-        models = [m.get("id") for m in (resp.json().get("data") or [])]
-        return {"ok": True, "message": "连接正常", "detail": {"models": models}}
+        async with httpx.AsyncClient(timeout=20.0, trust_env=False) as client:
+            resp = await client.post(_endpoint(), json=payload, headers=_headers())
     except httpx.HTTPError as exc:
-        return {"ok": False, "message": str(exc)}
+        return {"ok": False, "message": f"连接失败：{exc}"}
+    if resp.status_code >= 400:
+        body = (resp.text or "")[:300]
+        if resp.status_code in (401, 403):
+            return {
+                "ok": False,
+                "message": f"鉴权失败(HTTP {resp.status_code})，请检查 API Key/APIPassword 是否正确：{body}",
+            }
+        if resp.status_code == 404:
+            return {
+                "ok": False,
+                "message": "地址路径错误(HTTP 404)：base_url 应以 /v1 结尾，或直接填完整的 .../v1/chat/completions",
+            }
+        if resp.status_code == 400:
+            return {
+                "ok": False,
+                "message": f"请求被拒(HTTP 400)，多为模型名称不存在或参数错误：{body}",
+            }
+        return {"ok": False, "message": f"HTTP {resp.status_code}: {body}"}
+    # 解析成功响应，取一点内容回显
+    try:
+        data = resp.json()
+        content = ((data.get("choices") or [{}])[0].get("message", {}).get("content") or "").strip()
+    except Exception:
+        return {"ok": True, "message": "连接正常（返回非标准 JSON，但 HTTP 200）"}
+    detail: dict[str, Any] = {"model": model}
+    if content:
+        detail["sample"] = content[:60]
+    return {"ok": True, "message": "连接正常", "detail": detail}

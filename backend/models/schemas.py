@@ -337,6 +337,7 @@ class ConnectionTestRequest(BaseModel):
     secret_key: str | None = None  # 需要 AK/SK 双密钥的服务（如百度 OCR / 讯飞 OCR 的 APISecret）
     app_id: str | None = None  # 讯飞 OCR 等需要 AppID 的服务，先测后存时临时生效
     provider: str | None = None  # OCR 服务类型（tuling / baidu / xfyun），先测后存时临时生效
+    model: str | None = None  # 大模型名称，先测后存时临时生效（如讯飞星火 4.0Ultra）
 
 
 # --------------------------------------------------------------------------- #

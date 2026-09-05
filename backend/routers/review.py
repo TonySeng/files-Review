@@ -391,6 +391,7 @@ async def _drive_task(tid: str, req: ReviewRequest) -> None:
             rule_group_ids=req.rule_group_ids,
             auto_match=req.auto_match,
             legal_rulesets=_legal_ruleset_meta(req.legal_ruleset_ids or [], task_user_id),
+            cache_enabled=req.cache_enabled,
         )
 
         async for evt in gen:
@@ -698,6 +699,7 @@ async def _create_chained_task(
             "kb_enabled": req.kb_enabled,
             "kb_id": _effective_kb_id(req),
             "web_search_enabled": req.web_search_enabled,
+            "cache_enabled": req.cache_enabled,
             "extra_instruction": req.extra_instruction,
             "file_names": file_names,
             "rule_count": len(rules),
@@ -751,6 +753,7 @@ async def review_stream(req: ReviewRequest, caller: dict = Depends(deps.get_call
                 task_id=None,
                 user_id=caller["user_id"],
                 legal_rulesets=_legal_ruleset_meta(req.legal_ruleset_ids or [], caller["user_id"]),
+                cache_enabled=req.cache_enabled,
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as exc:  # noqa: BLE001 - 保证前端能收到错误事件
@@ -829,6 +832,7 @@ async def create_task(req: ReviewRequest, caller: dict = Depends(deps.get_caller
             "kb_enabled": req.kb_enabled,
             "kb_id": _effective_kb_id(req),
             "web_search_enabled": req.web_search_enabled,
+            "cache_enabled": req.cache_enabled,
             "extra_instruction": req.extra_instruction,
             "file_names": file_names,
             "rule_count": len(rules),

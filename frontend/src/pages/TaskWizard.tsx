@@ -53,6 +53,9 @@ interface Props {
   webSearchEnabled: boolean
   onWebSearchEnabledChange: (v: boolean) => void
   webSearchConfigured: boolean
+  /** 任务级缓存模式：default=跟随系统配置；on=本任务强制启用；off=本任务强制禁用 */
+  cacheMode: 'default' | 'on' | 'off'
+  onCacheModeChange: (v: 'default' | 'on' | 'off') => void
   extraInstruction: string
   onExtraInstructionChange: (v: string) => void
   canStart: boolean
@@ -154,6 +157,8 @@ export default function TaskWizard(props: Props) {
               webSearchEnabled={props.webSearchEnabled}
               onWebSearchEnabledChange={props.onWebSearchEnabledChange}
               webSearchConfigured={props.webSearchConfigured}
+              cacheMode={props.cacheMode}
+              onCacheModeChange={props.onCacheModeChange}
               extraInstruction={props.extraInstruction}
               onExtraInstructionChange={props.onExtraInstructionChange}
               canStart
@@ -199,6 +204,13 @@ export default function TaskWizard(props: Props) {
                 </Descriptions.Item>
                 <Descriptions.Item label="联网搜索">
                   {props.webSearchEnabled ? '已启用' : '未启用'}
+                </Descriptions.Item>
+                <Descriptions.Item label="缓存">
+                  {props.cacheMode === 'on'
+                    ? '本任务强制启用'
+                    : props.cacheMode === 'off'
+                      ? '本任务强制禁用'
+                      : '跟随系统配置'}
                 </Descriptions.Item>
                 <Descriptions.Item label="补充要求">
                   {props.extraInstruction || <Typography.Text type="secondary">（无）</Typography.Text>}

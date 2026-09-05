@@ -684,6 +684,7 @@ export const api = {
     kb_enabled?: boolean
     kb_id?: string
     web_search_enabled?: boolean
+    cache_enabled?: boolean | null
     extra_instruction?: string
     legal_ruleset_ids?: string[]
     legal_rules_only?: boolean
@@ -948,6 +949,7 @@ export async function streamReview(
     kb_enabled?: boolean
     kb_id?: string
     web_search_enabled?: boolean
+    cache_enabled?: boolean | null
     extra_instruction?: string
     legal_ruleset_ids?: string[]
     legal_rules_only?: boolean

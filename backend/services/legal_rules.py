@@ -652,6 +652,18 @@ def _meta_identity_keys(metas: list[dict[str, Any]]) -> set[tuple[str, str]]:
     return out
 
 
+def _text_fp(text: str) -> str:
+    """正文内容指纹：去除全部空白字符后取 md5。
+
+    用于复用判定的内容一致性校验——同名同文号的法规，正文指纹一致才允许复用
+    历史解析结果。去空白可规避 PDF/DOCX 不同提取器带来的换行/空格差异，
+    实质文字变化（修订、节选、缺章）必然导致指纹不同。
+    """
+    import re as _re
+
+    return hashlib.md5(_re.sub(r"\s+", "", text or "").encode("utf-8")).hexdigest()
+
+
 def _find_reusable_ruleset(
     *,
     source_files: list[dict[str, Any]],
@@ -664,8 +676,13 @@ def _find_reusable_ruleset(
     匹配优先级：
     1. 来源文件+参数指纹完全一致（原有行为）；
     2. 法规文件 MD5 集合与已有解析记录相同（参数变化也复用）；
-    3. 解析出的法规版本信息（法规名称+文号）已存在于既有记录。
+    3. 法规版本信息（法规名称+文号）匹配 **且逐文件通过正文内容指纹校验**。
     返回 (规则集记录, 复用依据)；无可复用时 (None, "")。
+
+    第 3 级安全语义（2026-09-05 修复）：仅身份键重叠不再复用——同名法规的不同文本
+    （修订稿、节选、不同来源提取版本）会被误复用。现在要求新上传的 **每个** 文件
+    的身份键与正文指纹（_text_fp，去空白 md5）都在既有记录中得到确认，任一文件
+    无法确认一致（指纹不同、或历史记录缺指纹且原文已不可取）即不复用，走正常解析。
     """
     with _lock:
         candidates = [
@@ -687,15 +704,36 @@ def _find_reusable_ruleset(
             if old_md5 and (old_md5 == new_md5 or new_md5 <= old_md5):
                 return r, "法规文件 MD5 与已有解析记录相同"
 
-    # 3) 法规版本信息已存在
-    new_keys = _meta_identity_keys(source_meta)
-    if new_keys:
+    # 3) 法规版本信息匹配 + 正文内容一致性逐文件确认
+    new_fps: dict[tuple[str, str], str] = {}
+    for m in source_meta or []:
+        key = (str(m.get("law_name") or "").strip(), str(m.get("doc_number") or "").strip())
+        fp = str(m.get("text_fp") or "")
+        if any(key) and fp:
+            new_fps[key] = fp
+    # 每个新文件都必须有可确认的身份（缺元数据的文件无法做版本比对，直接放弃第 3 级）
+    if new_fps and len(new_fps) == len(source_files):
         for r in candidates:
-            old_keys = _meta_identity_keys(r.get("source_meta") or [])
-            hit = new_keys & old_keys
-            if hit:
-                law_name = next(iter(hit))[0]
-                return r, f"法规《{law_name}》的版本信息已存在解析结果"
+            old_fps: dict[tuple[str, str], str] = {}
+            for m in r.get("source_meta") or []:
+                key = (
+                    str(m.get("law_name") or "").strip(),
+                    str(m.get("doc_number") or "").strip(),
+                )
+                if not any(key):
+                    continue
+                fp = str(m.get("text_fp") or "")
+                if not fp:
+                    # 历史记录缺正文指纹（旧版本数据）：尝试用 file_store 现算；
+                    # 原文已不可取则该键视为无法确认 → 不复用（宁可重解析）
+                    old_rec = file_store.get(str(m.get("file_id") or ""))
+                    if old_rec:
+                        fp = _text_fp(old_rec.get("text") or "")
+                if fp:
+                    old_fps[key] = fp
+            if new_fps and all(old_fps.get(k) == fp for k, fp in new_fps.items()):
+                law_name = next(iter(new_fps))[0]
+                return r, f"法规《{law_name}》身份匹配且正文内容一致性校验通过"
     return None, ""
 
 
@@ -1047,7 +1085,14 @@ async def create_ruleset(
         filename = rec.get("filename") or fid
         meta = _extract_doc_meta(text)
         if meta:
-            source_meta.append({"file_id": fid, "filename": filename, **meta})
+            source_meta.append(
+                {
+                    "file_id": fid,
+                    "filename": filename,
+                    "text_fp": _text_fp(text),
+                    **meta,
+                }
+            )
         source_files.append(
             {
                 "file_id": fid,

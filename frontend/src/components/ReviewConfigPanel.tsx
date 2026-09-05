@@ -23,6 +23,9 @@ interface Props {
   webSearchEnabled: boolean
   onWebSearchEnabledChange: (v: boolean) => void
   webSearchConfigured: boolean
+  /** 任务级缓存模式：default=跟随系统配置；on=本任务强制启用；off=本任务强制禁用 */
+  cacheMode: 'default' | 'on' | 'off'
+  onCacheModeChange: (v: 'default' | 'on' | 'off') => void
   extraInstruction: string
   onExtraInstructionChange: (v: string) => void
   canStart: boolean
@@ -46,6 +49,8 @@ export default function ReviewConfigPanel({
   webSearchEnabled,
   onWebSearchEnabledChange,
   webSearchConfigured,
+  cacheMode,
+  onCacheModeChange,
   extraInstruction,
   onExtraInstructionChange,
   canStart,
@@ -133,6 +138,27 @@ export default function ReviewConfigPanel({
             description="请在「服务配置」中配置联网搜索API密钥。"
           />
         )}
+
+        <div className="rc-row rc-row--block">
+          <Typography.Text className="rc-label rc-label--block">
+            缓存（本任务独立控制）
+          </Typography.Text>
+          <Select
+            style={{ width: '100%' }}
+            size="small"
+            value={cacheMode}
+            onChange={onCacheModeChange}
+            options={[
+              { value: 'default', label: '跟随系统配置（默认）' },
+              { value: 'on', label: '本任务强制启用缓存' },
+              { value: 'off', label: '本任务强制禁用缓存' },
+            ]}
+          />
+          <Typography.Text type="secondary" className="rc-tip rc-tip--block">
+            控制「结论缓存」与「一致性摘要缓存」：禁用后本任务每次都全量调用模型，
+            不复用历史结论，也不写入缓存
+          </Typography.Text>
+        </div>
 
         <Input.TextArea
           rows={2}

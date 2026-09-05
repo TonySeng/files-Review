@@ -107,6 +107,11 @@ class ReviewRequest(BaseModel):
     kb_enabled: bool | None = None
     kb_id: str | None = None
     web_search_enabled: bool | None = None  # 是否启用联网搜索
+    # 任务级缓存开关（2026-09-05 新增）：独立于全局缓存配置。
+    #   None（默认）= 各缓存跟随全局 findings_cache_enabled / consistency_cache_enabled；
+    #   True  = 本任务强制启用缓存（即使全局关闭）；
+    #   False = 本任务强制禁用缓存（即使全局开启），每次审核全量调用 LLM。
+    cache_enabled: bool | None = None
     extra_instruction: str = ""
     # 确定性执行：重跑时可显式携带历史版本指纹，强制「按历史版本重跑」以保证可复现。
     # 不传则由引擎按当前生效版本自动解析（确定性模式默认开启）。

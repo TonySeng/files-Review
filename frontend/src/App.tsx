@@ -89,6 +89,9 @@ export default function App() {
   const [kbId, setKbId] = useState('')
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([])
   const [webSearchEnabled, setWebSearchEnabled] = useState(false)
+  // 任务级缓存模式（2026-09-05 新增）：default=跟随系统全局缓存开关；
+  // on/off=本任务强制启用/禁用缓存，独立于全局配置（对应后端 cache_enabled 三态）
+  const [cacheMode, setCacheMode] = useState<'default' | 'on' | 'off'>('default')
   const [extraInstruction, setExtraInstruction] = useState('')
   // 审核模式不再手动选择：由所选规则集 / 规则组自动推导（见 utils/deriveMode）
   const reviewMode = useMemo(
@@ -433,6 +436,7 @@ export default function App() {
             kb_enabled: kbEnabled,
             kb_id: kbId || undefined,
             web_search_enabled: webSearchEnabled,
+            cache_enabled: cacheMode === 'default' ? undefined : cacheMode === 'on',
             extra_instruction: extraInstruction,
           }
           // 按所选策略组装规则参数（三套规则来源互斥，仅其中一种生效）
@@ -485,6 +489,7 @@ export default function App() {
       kbEnabled,
       kbId,
       webSearchEnabled,
+      cacheMode,
       extraInstruction,
       tasks,
       navigate,
@@ -656,6 +661,8 @@ export default function App() {
           webSearchEnabled={webSearchEnabled}
           onWebSearchEnabledChange={setWebSearchEnabled}
           webSearchConfigured={webSearchConfigured}
+          cacheMode={cacheMode}
+          onCacheModeChange={setCacheMode}
           extraInstruction={extraInstruction}
           onExtraInstructionChange={setExtraInstruction}
           canStart={canStart}

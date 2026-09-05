@@ -91,6 +91,8 @@ export default function TaskDetailPage({
   const [editKbEnabled, setEditKbEnabled] = useState(false)
   const [editKbId, setEditKbId] = useState('')
   const [editWeb, setEditWeb] = useState(false)
+  // 重跑时的任务级缓存模式（沿用历史任务值，默认跟随系统配置）
+  const [editCacheMode, setEditCacheMode] = useState<'default' | 'on' | 'off'>('default')
   const [editExtra, setEditExtra] = useState('')
 
   // 审核模式不手动选择，由重跑弹窗内的规则集 / 规则组选择自动推导
@@ -194,6 +196,9 @@ export default function TaskDetailPage({
     setEditKbEnabled(!!req.kb_enabled)
     setEditKbId(req.kb_id || '')
     setEditWeb(!!req.web_search_enabled)
+    setEditCacheMode(
+      req.cache_enabled === true ? 'on' : req.cache_enabled === false ? 'off' : 'default',
+    )
     setEditExtra(req.extra_instruction || '')
     setRerunOpen(true)
   }
@@ -211,6 +216,7 @@ export default function TaskDetailPage({
       kb_enabled: editKbEnabled,
       kb_id: editKbId || undefined,
       web_search_enabled: editWeb,
+      cache_enabled: editCacheMode === 'default' ? undefined : editCacheMode === 'on',
       extra_instruction: editExtra,
     }
     onRerun(
@@ -426,6 +432,13 @@ export default function TaskDetailPage({
                   <Descriptions.Item label="联网搜索">
                     {req.web_search_enabled ? '已启用' : '未启用'}
                   </Descriptions.Item>
+                  <Descriptions.Item label="缓存">
+                    {req.cache_enabled === true
+                      ? '本任务强制启用'
+                      : req.cache_enabled === false
+                        ? '本任务强制禁用'
+                        : '跟随系统配置'}
+                  </Descriptions.Item>
                   <Descriptions.Item label="补充要求" span={2}>
                     {req.extra_instruction || (
                       <Typography.Text type="secondary">（无）</Typography.Text>
@@ -530,6 +543,19 @@ export default function TaskDetailPage({
           <Space size={8} align="center">
             <Switch checked={editWeb} onChange={setEditWeb} />
             <Typography.Text>启用联网搜索</Typography.Text>
+          </Space>
+          <Space size={8} align="center">
+            <Typography.Text>缓存：</Typography.Text>
+            <Select
+              style={{ width: 180 }}
+              value={editCacheMode}
+              onChange={setEditCacheMode}
+              options={[
+                { value: 'default', label: '跟随系统配置' },
+                { value: 'on', label: '本任务强制启用' },
+                { value: 'off', label: '本任务强制禁用' },
+              ]}
+            />
           </Space>
           <Input.TextArea
             rows={3}

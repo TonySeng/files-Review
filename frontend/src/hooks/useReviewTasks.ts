@@ -21,6 +21,8 @@ export interface StartPayload {
   kb_enabled?: boolean
   kb_id?: string
   web_search_enabled?: boolean
+  /** 任务级缓存开关：undefined=跟随全局；true=强制启用；false=强制禁用 */
+  cache_enabled?: boolean | null
   extra_instruction?: string
   legal_ruleset_ids?: string[]
   legal_rules_only?: boolean

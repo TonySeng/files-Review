@@ -100,7 +100,7 @@ def _compose_docs(docs: list[dict[str, Any]]) -> tuple[str, list[str]]:
 
 async def _build_docs_text(
     docs: list[dict[str, Any]], mode: str, emit: Any, temperature: float | None = None,
-    rule_token: str | None = None,
+    rule_token: str | None = None, cache_enabled: bool | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """拼装送审文档上下文，并返回「每份文档的紧凑表征」供一致性要素提取复用。
 
@@ -115,6 +115,8 @@ async def _build_docs_text(
         小文档=截断原文）。一致性要素提取直接复用它，而非把 60k 原始文本喂给模型，
         从而把一致性阶段最大的输入源从 60k 压到 5–20k，规避 DeepSeek-V4-Flash 在
         大上下文上的分钟级慢调用（Fix A）。
+
+    cache_enabled: 任务级缓存开关（None=跟随全局各缓存开关）。
     """
     limit = int(config.get("max_chars_per_doc", 60000))
     max_seg = int(config.get("doc_summary_max_segments", 40))
@@ -152,6 +154,7 @@ async def _build_docs_text(
                 doc, mode, label, elements=None, temperature=temperature,
                 max_chars=None, max_segments=max_seg,
                 doc_md5=doc.get("md5"), rule_token=rule_token,
+                cache_enabled=cache_enabled,
             )
             if not summary.strip():
                 summary = truncate(text, limit)  # 摘要兜底：退回截断原文
@@ -207,11 +210,21 @@ def _split_text(text: str, size: int) -> list[str]:
     return segs
 
 
+def _cache_on(explicit: bool | None, key: str, default: bool = True) -> bool:
+    """缓存开关统一判定：任务级显式指定（cache_enabled）优先，否则回落全局配置项。
+
+    任务级三态语义：None=跟随全局（默认，向后兼容）；True=本任务强制启用；
+    False=本任务强制禁用（不受全局开关影响）。
+    """
+    return bool(config.get(key, default)) if explicit is None else bool(explicit)
+
+
 async def _summarize_doc(
     doc: dict[str, Any], mode: str, label: str, elements: list[Any] | None = None,
     temperature: float | None = None,
     max_chars: int | None = None, max_segments: int | None = None,
     doc_md5: str | None = None, rule_token: str | None = None,
+    cache_enabled: bool | None = None,
 ) -> str:
     """对单篇文档分段摘要提取，返回一致性比对用的关键事实文本。
 
@@ -233,7 +246,7 @@ async def _summarize_doc(
     if not text.strip():
         return ""
 
-    cache_enabled = bool(config.get("consistency_cache_enabled", True))
+    cache_enabled = _cache_on(cache_enabled, "consistency_cache_enabled")
     ckey: str | None = None
     if cache_enabled:
         try:
@@ -305,6 +318,7 @@ async def _extract_file_elements(
     summary_text: str | None = None,
     doc_md5: str | None = None,
     rule_token: str | None = None,
+    cache_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """从单个文件一次性提取一致性要素取值（紧凑结构化），供一致性阶段并行 Phase1 + 轻量 Phase2 比对。
 
@@ -331,7 +345,7 @@ async def _extract_file_elements(
     if not text.strip():
         return {}
 
-    cache_enabled = bool(config.get("consistency_cache_enabled", True))
+    cache_enabled = _cache_on(cache_enabled, "consistency_cache_enabled")
     ckey: str | None = None
     if cache_enabled:
         try:
@@ -1834,6 +1848,7 @@ async def run_review(
     rule_group_ids: list[str] | None = None,
     auto_match: bool = False,
     legal_rulesets: list[dict[str, Any]] | None = None,
+    cache_enabled: bool | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """执行完整审核，产出事件流。
 
@@ -1843,6 +1858,9 @@ async def run_review(
         deterministic: 是否确定性执行。None=跟随配置(deterministic_mode)；True=强制开启；
             False=强制关闭。开启时固定规则执行顺序、temperature=0、串行执行、不依赖系统时间，
             并对 LLM 输出做结构化约束与确定性归一化，保证可重复审核结果一致、可追溯。
+        cache_enabled: 任务级缓存开关。None=各缓存跟随全局配置（默认，向后兼容）；
+            True=本任务强制启用结论缓存与一致性摘要/要素缓存；False=本任务强制禁用，
+            不受全局 findings_cache_enabled / consistency_cache_enabled 影响。
     """
     # 确定性模式判定：显式参数 > 配置项。默认开启（可重复审核一致）。
     det_mode = (
@@ -1887,7 +1905,8 @@ async def run_review(
             # 返回 (拼接上下文, 每份文档紧凑表征, 按文档对齐的文本块)；
             # 后者供一致性要素提取复用，且用于按规则关联文档类型过滤后重建子集上下文。
             docs_text, doc_summaries, per_doc_blocks = await _build_docs_text(
-                docs, mode, emit, det_temperature, rule_token=consistency_rule_token
+                docs, mode, emit, det_temperature, rule_token=consistency_rule_token,
+                cache_enabled=cache_enabled,
             )
 
             # 确定性规则引擎预检：对带 structured 可执行条件的规则，先跑可计算判定，
@@ -2031,7 +2050,7 @@ async def run_review(
                     # 结果缓存（方案 C）：相同输入复用历史批次结论，跳过 LLM 调用。
                     # 仅当存在需 LLM 判定的规则时适用；整批锁定的分支维持原逻辑。
                     batch_cache_key = None
-                    if config.get("findings_cache_enabled", True) and llm_rules:
+                    if _cache_on(cache_enabled, "findings_cache_enabled") and llm_rules:
                         batch_cache_key = findings_cache.make_key(
                             doc_hashes=[
                                 d.get("parsed_hash") or versioning.parsed_content_hash(d.get("text") or "")
@@ -2423,6 +2442,7 @@ async def run_review(
                         elems = await _extract_file_elements(
                             d, elements, mode, det_temperature, summary_text=sum_text,
                             doc_md5=d.get("md5"), rule_token=consistency_rule_token,
+                            cache_enabled=cache_enabled,
                         )
                         return d.get("filename", f"文档{di + 1}"), elems
 

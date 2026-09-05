@@ -144,6 +144,9 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
         rawModel && rawModel !== '***' ? rawModel : undefined,
       )
       setTests((prev) => ({ ...prev, [target]: { ok: res.ok, message: res.message } }))
+      if (res.ok) {
+        message.info('连接测试通过。注意：测试使用的是表单当前值，不会保存配置；请点击「保存」按钮才会持久化到服务端。')
+      }
       if (target === 'kb' && res.ok) {
         const list = (res.detail as { knowledge_bases?: KnowledgeBase[] })?.knowledge_bases
         if (list) setKbs(list)

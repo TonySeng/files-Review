@@ -57,7 +57,7 @@
 | 后端 | Python 3.13 + FastAPI + httpx（全异步） |
 | 文档解析 | PyMuPDF（PDF）、python-docx（Word）、openpyxl（Excel） |
 | 大模型 | 千问 80B（vLLM 部署，OpenAI 兼容协议；支持流式） |
-| OCR | 图聆云图文识别（默认）/ 百度智能云 OCR（AK/SK 授权，可配置切换） |
+| OCR | 图聆云图文识别（默认）/ 百度智能云 OCR（AK/SK 授权）/ 讯飞开放平台通用文字识别 intsig（AppID+APIKey+APISecret 签名），可配置切换 |
 | 知识库 | LLM-Docqa（SSE 流式问答） |
 | 数据存储 | SQLite（默认）/ MySQL / PostgreSQL（存储层可配置热切换） |
 
@@ -70,16 +70,22 @@
 | 千问 80B | `http://223.111.149.152:8000` | `POST /v1/chat/completions`，模型名 `/model` |
 | OCR | `http://223.111.149.152:8090` | `POST /tuling/uocr/v2/recognize`（multipart：`trackId`、`category`、`picFile`） |
 | OCR（百度，可选） | `https://aip.baidubce.com` | `POST /rest/2.0/ocr/v1/general_basic?access_token=...`（AK/SK 换 token，base64 表单） |
+| OCR（讯飞，可选） | `https://api.xf-yun.com` | `POST /v1/private/hh_ocr_recognize_doc`（通用文字识别 intsig，URL hmac-sha256 签名，base64 JSON） |
 | 知识库 | `http://localhost:8000` | `POST /api/qa/ask`（SSE），`GET /api/knowledge-bases` |
 
 > 知识库需预先建立法规库并导入《招标投标法》《招标投标法实施条例》等文档。当前环境已有「招采法律法规」库（9 份文档）。
 
-> **OCR 服务可选两种**（「服务配置 → OCR 服务 → 服务类型」切换，改后即测即生效）：
+> **OCR 服务可选三种**（「服务配置 → OCR 服务 → 服务类型」切换，改后即测即生效）：
 > - **图聆云**（默认，免鉴权）：multipart 上传，无需密钥；
 > - **百度智能云**：填入控制台应用的 API Key / Secret Key（自动换取并缓存 access_token，
 >   过期前自动刷新；token 失效自动重试）。免费额度与 QPS 限制以百度控制台为准；
 >   高精度版将接口路径改为 `/rest/2.0/ocr/v1/accurate_basic`。密钥保存后脱敏回显，
 >   留空表示保持不变。
+> - **讯飞开放平台**：填入应用的 AppID / APIKey / APISecret（请求 URL 按 hmac-sha256
+>   签名，服务器时钟偏差需小于 5 分钟；图片 base64 JSON 提交，≤4M）。支持印刷体与
+>   手写体、52 种语种。注意业务级错误（如 11201 授权不足/日流控超限）包在 HTTP 500
+>   中返回，系统已解析并给出中文提示；需在讯飞控制台为应用开通「通用文字识别
+>   intsig」能力后方可调用。密钥保存后脱敏回显，留空表示保持不变。
 
 ## 快速开始
 

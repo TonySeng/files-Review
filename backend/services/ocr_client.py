@@ -564,10 +564,21 @@ async def _recognize_xfyun(
         hint = ""
         if resp.status_code == 401:
             raw = resp.text or ""
-            if "apikey not found" in raw:
+            rl = raw.lower()
+            if "apikey not found" in rl:
                 hint = "（网关查无此 APIKey：请到讯飞控制台核对当前生效的 APIKey/APISecret —— 若重置过密钥，旧密钥会立即失效）"
+            elif "hmac" in rl or "signature" in rl:
+                # APIKey 已被识别（否则会是 apikey not found），唯独签名不匹配：
+                # 几乎必然是 APIKey 与 APISecret 不属于同一套密钥。
+                hint = (
+                    "（HMAC 签名校验失败：APIKey 已被识别，但用于签名的 APISecret 与之不匹配。"
+                    "最常见两种原因：① APIKey 与 APISecret 不是同一套——讯飞控制台「重置 APISecret」会"
+                    "同时换发，只更新其一即失效；② 把星火 LLM 的 APIPassword（单串密码）误填为 OCR 的"
+                    " APIKey/APISecret。二者是不同凭证：OCR webapi 必须用「WebAPI 的 APIKey + APISecret」配对，"
+                    "而星火 LLM 用的是另一个入口的 APIPassword）"
+                )
             else:
-                hint = "（检查 AppID / APIKey / APISecret 是否正确）"
+                hint = "（检查 AppID / APIKey / APISecret 是否正确，且三者属于同一应用）"
         elif resp.status_code == 403:
             hint = "（服务器时钟偏差超过 300 秒，请校准系统时间）"
         raise OCRError(f"OCR 返回 {resp.status_code}: {resp.text[:200]}{hint}")

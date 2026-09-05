@@ -37,7 +37,7 @@ const BAIDU_BASE = 'https://aip.baidubce.com'
 const BAIDU_PATH = '/rest/2.0/ocr/v1/general_basic'
 const BAIDU_TOKEN_PATH = '/oauth/2.0/token'
 const XFYUN_BASE = 'https://api.xf-yun.com'
-const XFYUN_PATH = '/v1/private/hh_ocr_recognize_doc'
+const XFYUN_PATH = '/v1/private/sf8e6aca1'
 
 export default function SettingsDrawer({ open, onClose, onSaved, role, currentUser }: Props) {
   const { message } = AntdApp.useApp()
@@ -346,6 +346,7 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
               } else if (v === 'xfyun') {
                 if (!curBase || curBase === TULING_BASE || curBase === BAIDU_BASE)
                   patch.ocr_base_url = XFYUN_BASE
+                // 仅当前路径是其他服务的默认值时才带出讯飞默认；用户已手动选择的讯飞路径（含 intsig）保持不动
                 if (!curPath || curPath === TULING_PATH || curPath === BAIDU_PATH)
                   patch.ocr_path = XFYUN_PATH
               } else {
@@ -390,9 +391,9 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
               placeholder={
                 ocrProv === 'baidu'
                   ? '/rest/2.0/ocr/v1/general_basic（通用文字识别）'
-                  : ocrProv === 'xfyun'
-                    ? '/v1/private/hh_ocr_recognize_doc（通用文字识别 intsig）'
-                    : '/tuling/uocr/v2/recognize'
+                  :                 ocrProv === 'xfyun'
+                  ? '/v1/private/sf8e6aca1（通用文字识别）或 /v1/private/hh_ocr_recognize_doc（intsig 52语种）'
+                  : '/tuling/uocr/v2/recognize'
               }
             />
           </Form.Item>
@@ -461,10 +462,12 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
               </Form.Item>
             </Space>
             <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: -8 }}>
-              讯飞开放平台通用文字识别
-              intsig（支持印刷体与手写体、52 种语言）：请求 URL 按 hmac-sha256
-              签名（host/date/authorization，服务器时钟偏差需小于 5
-              分钟），图片以 base64 JSON 提交（≤4M）。免费额度与并发限制以控制台为准。
+              讯飞开放平台通用文字识别（支持印刷体与手写体）：请求 URL 按 hmac-sha256
+              签名（host/date/authorization，服务器时钟偏差需小于 5 分钟），图片以 base64
+              JSON 提交（≤4M）。接口路径二选一：/v1/private/sf8e6aca1（通用文字识别，
+              中英文）或 /v1/private/hh_ocr_recognize_doc（intsig，52
+              种语种），需在控制台为应用开通对应服务并核对密钥（重置过的密钥立即失效）。
+              免费额度与并发限制以控制台为准。
             </Typography.Paragraph>
           </>
         ) : (

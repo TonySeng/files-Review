@@ -16,15 +16,19 @@
             响应: {"words_result":[{"words":"..."}], "words_result_num":N}
                   失败: {"error_code":17,"error_msg":"..."}
 
-3) 讯飞开放平台 通用文字识别 intsig（xfyun，hmac-sha256 签名鉴权，JSON 请求体）
-  请求: POST {base}{path} 默认 https://api.xf-yun.com/v1/private/hh_ocr_recognize_doc
-        URL 携带鉴权 query（host/date/authorization，date 为 RFC1123 GMT，允许 ±300s 偏移）
-        body: {"header":{"app_id","status":3},
-               "parameter":{"<服务名>":{"recognizeDocumentRes":{"encoding":"utf8","compress":"raw","format":"json"}}},
-               "payload":{"image":{"encoding":"png|jpg","image":<base64>,"status":3}}}
-  响应: {"header":{"code":0,"message":"success"},
-         "payload":{"recognizeDocumentRes":{"text":<base64>}}}
-        text base64 解码后为 {"whole_text":"...", "lines":[{"text":"..."}], ...}
+3) 讯飞开放平台 通用文字识别（xfyun，hmac-sha256 签名鉴权，JSON 请求体）
+  请求: POST {base}{path}
+    - /v1/private/sf8e6aca1（通用文字识别，印刷+手写，中英文）
+      body: {"header":{"app_id","status":3},
+             "parameter":{"<服务名>":{"category":"ch_en_public_cloud","result":{...}}},
+             "payload":{"<服务名>_data_1":{"encoding":"jpg|png","image":<base64>,"status":3}}}
+      响应: payload.result.text → base64 解码为 {"pages":[{"lines":[{"words":[{"content"}]}]}]}
+    - /v1/private/hh_ocr_recognize_doc（通用文字识别 intsig，52 种语种）
+      body: {"header":{"app_id","status":3},
+             "parameter":{"hh_ocr_recognize_doc":{"recognizeDocumentRes":{...}}},
+             "payload":{"image":{...}}}
+      响应: payload.recognizeDocumentRes.text → 解码为 {"whole_text":"...","lines":[{"text":"..."}]}
+  鉴权: URL 携带 query（host/date/authorization，date 为 RFC1123 GMT，允许 ±300s 偏移）
 
 新增 provider 只需在此实现 _recognize_xxx 并登记到 _PROVIDERS。
 """
@@ -379,15 +383,16 @@ async def _recognize_baidu(
     return _extract_text(payload)
 
 
-# ---- 讯飞开放平台 通用文字识别 intsig（xfyun） ----
+# ---- 讯飞开放平台 通用文字识别（xfyun，支持 sf8e6aca1 与 hh_ocr_recognize_doc 两个服务） ----
 _XF_BASE = "https://api.xf-yun.com"
-_XF_PATH = "/v1/private/hh_ocr_recognize_doc"
+_XF_PATH = "/v1/private/sf8e6aca1"  # 通用文字识别（印刷+手写，中英文，demo 默认）
+_XF_INTSIG_PATH = "/v1/private/hh_ocr_recognize_doc"  # 通用文字识别 intsig（52 语种）
 # 其他 provider 的默认路径：provider 切到 xfyun 但路径未同步时，自动回落到讯飞默认
 _XF_FOREIGN_PATHS = ("/tuling/", "/rest/2.0/ocr/")
 
 
 def _xfyun_url() -> str:
-    """拼装讯飞请求地址（base + path，均为空/为其他服务默认值时回落讯飞默认）。"""
+    """拼装讯飞请求地址（base + path，为空/为其他服务默认值时回落讯飞默认）。"""
     base = str(config.get("ocr_base_url", "") or "").rstrip("/")
     path = str(config.get("ocr_path", "") or "")
     if not base or base.startswith("http://223.111.149.152") or base == "https://aip.baidubce.com":
@@ -424,12 +429,38 @@ def _xfyun_signed_url(url: str, api_key: str, api_secret: str) -> str:
 
 
 def _xfyun_text(result_json: Any) -> str:
-    """从 text 解码后的结果 JSON 提取全文：优先 whole_text，缺省再按行拼接。"""
+    """从 text 解码后的结果 JSON 提取全文，兼容两个服务的形态：
+
+    - intsig(hh_ocr_recognize_doc)：{"whole_text": "..."} 或 {"lines": [{"text": "..."}]}
+    - sf8e6aca1(通用文字识别)：{"pages": [{"lines": [{"words": [{"content": "..."}]}]}]}
+    """
     if not isinstance(result_json, dict):
         return ""
     whole = str(result_json.get("whole_text") or "").strip()
     if whole:
         return whole
+
+    # sf8e6aca1 形态：pages[].lines[].words[].content（与图聆云 body 同构）
+    pages_text: list[str] = []
+    for page in result_json.get("pages") or []:
+        lines = []
+        for ln in (page or {}).get("lines") or []:
+            words = [
+                str((w or {}).get("content") or "").strip()
+                for w in ((ln or {}).get("words") or [])
+                if isinstance(w, dict)
+            ]
+            if words:
+                lines.append("".join(words))
+            elif isinstance(ln, dict) and (ln.get("content") or "").strip():
+                lines.append(str(ln["content"]).strip())
+        text = "\n".join(x for x in lines if x)
+        if text:
+            pages_text.append(text)
+    if pages_text:
+        return "\n".join(pages_text)
+
+    # intsig 形态：lines[].text
     lines = [
         str((item or {}).get("text") or "").strip()
         for item in (result_json.get("lines") or [])
@@ -438,10 +469,38 @@ def _xfyun_text(result_json: Any) -> str:
     return "\n".join(x for x in lines if x)
 
 
+def _xfyun_service(path: str) -> str:
+    """从请求路径取服务名（讯飞 parameter/payload 的 key 与服务名挂钩）。"""
+    return path.rstrip("/").rsplit("/", 1)[-1] or "sf8e6aca1"
+
+
+def _xfyun_build_body(service: str, app_id: str, encoding: str, b64_image: str) -> dict[str, Any]:
+    """按服务构造请求体：两个服务的 parameter/payload key 与内层字段不同。"""
+    body: dict[str, Any] = {"header": {"app_id": app_id, "status": 3}}
+    if service == "hh_ocr_recognize_doc":
+        # 通用文字识别 intsig：52 语种，响应 payload.recognizeDocumentRes
+        body["parameter"] = {
+            service: {
+                "recognizeDocumentRes": {"encoding": "utf8", "compress": "raw", "format": "json"}
+            }
+        }
+        body["payload"] = {"image": {"encoding": encoding, "image": b64_image, "status": 3}}
+    else:
+        # sf8e6aca1 等通用文字识别：响应 payload.result，解码后为 pages/lines/words
+        body["parameter"] = {
+            service: {
+                "category": "ch_en_public_cloud",
+                "result": {"encoding": "utf8", "compress": "raw", "format": "json"},
+            }
+        }
+        body["payload"] = {f"{service}_data_1": {"encoding": encoding, "image": b64_image, "status": 3}}
+    return body
+
+
 async def _recognize_xfyun(
     image_bytes: bytes, filename: str, client: httpx.AsyncClient
 ) -> str:
-    """讯飞 通用文字识别 intsig：hmac-sha256 URL 签名 + JSON 请求体。"""
+    """讯飞 通用文字识别：hmac-sha256 URL 签名 + JSON 请求体（按路径服务名适配）。"""
     app_id = str(config.get("ocr_xfyun_app_id", "") or "").strip()
     api_key = str(config.get("ocr_xfyun_api_key", "") or "").strip()
     api_secret = str(config.get("ocr_xfyun_api_secret", "") or "").strip()
@@ -450,31 +509,19 @@ async def _recognize_xfyun(
             "讯飞 OCR 未配置 AppID / APIKey / APISecret，请在「服务配置 → OCR 服务」中填写后保存"
         )
 
+    url = _xfyun_url()
+    service = _xfyun_service(urllib.parse.urlparse(url).path)
     timeout = httpx.Timeout(float(config.get("ocr_timeout", 60)), connect=15.0)
-    url = _xfyun_signed_url(_xfyun_url(), api_key, api_secret)
+    signed = _xfyun_signed_url(url, api_key, api_secret)
 
     # 讯飞限制：图片 base64 后 ≤4M，提交前统一压缩（与百度同规格）
     data = _fit_image(image_bytes)
     encoding = "png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "jpg"
-    body = {
-        "header": {"app_id": app_id, "status": 3},
-        "parameter": {
-            "hh_ocr_recognize_doc": {
-                "recognizeDocumentRes": {"encoding": "utf8", "compress": "raw", "format": "json"}
-            }
-        },
-        "payload": {
-            "image": {
-                "encoding": encoding,
-                "image": base64.b64encode(data).decode("ascii"),
-                "status": 3,
-            }
-        },
-    }
+    body = _xfyun_build_body(service, app_id, encoding, base64.b64encode(data).decode("ascii"))
 
     try:
         resp = await client.post(
-            url,
+            signed,
             json=body,
             headers={"Content-Type": "application/json", "host": urllib.parse.urlparse(url).netloc},
             timeout=timeout,
@@ -498,7 +545,7 @@ async def _recognize_xfyun(
                 10010: "授权额度不足（套餐过期或已用尽，请到讯飞控制台查看）",
                 10105: "认证失败（AppID / APIKey / APISecret 不匹配）",
                 10163: "请求参数异常（请检查 payload 结构与图片编码）",
-                11200: "该 AppID 未开通此能力授权或业务量超限（请到讯飞控制台领取/开通「通用文字识别 intsig」）",
+                11200: "该 AppID 未开通此能力授权或业务量超限（请到讯飞控制台领取/开通对应 OCR 服务）",
                 11201: "授权不足：日流控超限，当日调用次数已达上限（免费额度每日有限，可提交应用审核提额或购买套餐）",
                 11202: "授权不足：秒级流控超限（并发超过授权路数）",
                 11203: "授权不足：并发流控超限（并发路数超过授权限制）",
@@ -516,7 +563,11 @@ async def _recognize_xfyun(
     if resp.status_code >= 400:
         hint = ""
         if resp.status_code == 401:
-            hint = "（检查 AppID / APIKey / APISecret 是否正确）"
+            raw = resp.text or ""
+            if "apikey not found" in raw:
+                hint = "（网关查无此 APIKey：请到讯飞控制台核对当前生效的 APIKey/APISecret —— 若重置过密钥，旧密钥会立即失效）"
+            else:
+                hint = "（检查 AppID / APIKey / APISecret 是否正确）"
         elif resp.status_code == 403:
             hint = "（服务器时钟偏差超过 300 秒，请校准系统时间）"
         raise OCRError(f"OCR 返回 {resp.status_code}: {resp.text[:200]}{hint}")
@@ -524,10 +575,17 @@ async def _recognize_xfyun(
     if payload is None:
         raise OCRError(f"OCR 响应非 JSON: {resp.text[:200]}")
 
-    block = (payload.get("payload") or {}).get("recognizeDocumentRes") or {}
+    # 响应数据块：sf8e6aca1 为 payload.result，intsig 为 payload.recognizeDocumentRes —— 取首个含 text 的块
+    payload_block = payload.get("payload") or {}
+    block = next(
+        (v for v in payload_block.values() if isinstance(v, dict) and v.get("text")),
+        None,
+    )
+    if block is None:
+        raise OCRError(
+            f"OCR 响应缺少文本数据块（payload keys: {list(payload_block) or '无'}）"
+        )
     text_b64 = str(block.get("text") or "")
-    if not text_b64:
-        raise OCRError("OCR 响应缺少 recognizeDocumentRes.text 数据")
     try:
         result_json = json.loads(base64.b64decode(text_b64).decode("utf-8"))
     except Exception as exc:  # noqa: BLE001 - 解码失败给出原文片段便于排查

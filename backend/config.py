@@ -44,14 +44,18 @@ DEFAULTS: dict[str, Any] = {
     "rule_per_file_concurrent": 6,  # 单批次内"按文件并行"的并发上限（受全局 llm_max_concurrent 二次收口）
     "findings_cache_enabled": True,  # 方案C：相同输入批次复用历史结论，跳过 LLM 调用
     "kb_prefetch_global": True,  # 按规则按需预检索知识库：仅 need_legal_basis 的规则检索，依据只注入该规则 prompt，避免全量 KB 灌入每个请求
-    # OCR（支持两种服务：tuling=图聆云 免鉴权 multipart 上传；baidu=百度智能云 OCR，AK/SK 换 access_token）
-    "ocr_provider": "tuling",  # tuling | baidu
+    # OCR（支持三种服务：tuling=图聆云 免鉴权 multipart 上传；baidu=百度智能云 OCR，AK/SK 换 access_token；
+    #       xfyun=讯飞开放平台 通用文字识别 intsig，hmac-sha256 URL 签名鉴权）
+    "ocr_provider": "tuling",  # tuling | baidu | xfyun
     "ocr_base_url": "http://223.111.149.152:8090",
     "ocr_path": "/tuling/uocr/v2/recognize",
     "ocr_category": "atlas.doc",  # 仅图聆云使用
     "ocr_api_key": "",  # 百度智能云 API Key（tuling 不需要）
     "ocr_secret_key": "",  # 百度智能云 Secret Key（tuling 不需要）
     "ocr_token_path": "/oauth/2.0/token",  # 百度换取 access_token 的路径（挂在 base_url 下）
+    "ocr_xfyun_app_id": "",  # 讯飞开放平台 AppID（仅 xfyun 使用）
+    "ocr_xfyun_api_key": "",  # 讯飞开放平台 APIKey（仅 xfyun 使用）
+    "ocr_xfyun_api_secret": "",  # 讯飞开放平台 APISecret（仅 xfyun 使用）
     "ocr_timeout": 60,
     # 本地知识库（LLM-Docqa，SSE 流式问答）
     "kb_base_url": "http://host.docker.internal:8011",
@@ -285,4 +289,8 @@ def public_config() -> dict[str, Any]:
         cfg["ocr_api_key"] = "***"
     if cfg.get("ocr_secret_key"):
         cfg["ocr_secret_key"] = "***"
+    if cfg.get("ocr_xfyun_api_key"):
+        cfg["ocr_xfyun_api_key"] = "***"
+    if cfg.get("ocr_xfyun_api_secret"):
+        cfg["ocr_xfyun_api_secret"] = "***"
     return cfg

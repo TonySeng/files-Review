@@ -30,12 +30,14 @@ interface Props {
 
 type TestState = Record<string, { ok: boolean; message: string } | 'loading' | undefined>
 
-// OCR 双方服务的默认地址/路径（切换服务类型时自动带出）
+// OCR 各方服务的默认地址/路径（切换服务类型时自动带出）
 const TULING_BASE = 'http://223.111.149.152:8090'
 const TULING_PATH = '/tuling/uocr/v2/recognize'
 const BAIDU_BASE = 'https://aip.baidubce.com'
 const BAIDU_PATH = '/rest/2.0/ocr/v1/general_basic'
 const BAIDU_TOKEN_PATH = '/oauth/2.0/token'
+const XFYUN_BASE = 'https://api.xf-yun.com'
+const XFYUN_PATH = '/v1/private/hh_ocr_recognize_doc'
 
 export default function SettingsDrawer({ open, onClose, onSaved, role, currentUser }: Props) {
   const { message } = AntdApp.useApp()
@@ -64,6 +66,8 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
           'kb_api_key',
           'ocr_api_key',
           'ocr_secret_key',
+          'ocr_xfyun_api_key',
+          'ocr_xfyun_api_secret',
         ] as const
         const echo = { ...config }
         const configuredState: Record<string, boolean> = {}
@@ -112,16 +116,28 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
       // 密钥为空（已配置但未改动）时传 undefined，由后端沿用已存密钥；
       // 绝不向下发送 "***" 掩码，否则会被当成真实密钥导致 401。
       const rawKey = keyField ? form.getFieldValue(keyField) : undefined
-      // 百度 OCR 等需要 AK/SK 双密钥的服务：一并下发 Secret Key 与未保存的服务类型，
-      // 支持「填完即测」，无需先保存
-      const rawSecret = target === 'ocr' ? form.getFieldValue('ocr_secret_key') : undefined
+      // OCR 各服务的密钥字段不同：baidu 用 ocr_api_key/ocr_secret_key，
+      // xfyun 用 ocr_xfyun_api_key/ocr_xfyun_api_secret + ocr_xfyun_app_id。
+      // 一并下发未保存的服务类型，支持「填完即测」，无需先保存
       const rawProvider = target === 'ocr' ? form.getFieldValue('ocr_provider') : undefined
+      const ocrIsXfyun = rawProvider === 'xfyun'
+      const rawSecret = target === 'ocr'
+        ? form.getFieldValue(ocrIsXfyun ? 'ocr_xfyun_api_secret' : 'ocr_secret_key')
+        : undefined
+      const rawOcrKey = target === 'ocr' && !ocrIsXfyun
+        ? form.getFieldValue('ocr_api_key')
+        : undefined
+      const rawAppId = target === 'ocr' && ocrIsXfyun
+        ? form.getFieldValue('ocr_xfyun_app_id')
+        : undefined
       const res = await api.testConnection(
         target,
         urlField ? form.getFieldValue(urlField) : undefined,
-        rawKey && rawKey !== '***' ? rawKey : undefined,
+        ((rawKey && rawKey !== '***' ? rawKey : undefined) ??
+          (rawOcrKey && rawOcrKey !== '***' ? rawOcrKey : undefined)),
         rawSecret && rawSecret !== '***' ? rawSecret : undefined,
         rawProvider || undefined,
+        rawAppId && rawAppId !== '***' ? rawAppId : undefined,
       )
       setTests((prev) => ({ ...prev, [target]: { ok: res.ok, message: res.message } }))
       if (target === 'kb' && res.ok) {
@@ -148,6 +164,8 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
         'kb_api_key',
         'ocr_api_key',
         'ocr_secret_key',
+        'ocr_xfyun_api_key',
+        'ocr_xfyun_api_secret',
       ] as const) {
         if (!patch[k]) delete patch[k]
       }
@@ -307,21 +325,34 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
                 value: 'baidu',
                 label: '百度智能云 OCR（API Key + Secret Key 授权）',
               },
+              {
+                value: 'xfyun',
+                label: '讯飞开放平台 OCR（AppID + APIKey + APISecret 签名）',
+              },
             ]}
-            onChange={(v: 'tuling' | 'baidu') => {
+            onChange={(v: 'tuling' | 'baidu' | 'xfyun') => {
               // 切换服务类型时，若地址/路径仍是另一方的默认值则自动带出对应默认值
               const patch: Record<string, string> = {}
               const curBase = form.getFieldValue('ocr_base_url')
               const curPath = form.getFieldValue('ocr_path')
               if (v === 'baidu') {
-                if (!curBase || curBase === TULING_BASE) patch.ocr_base_url = BAIDU_BASE
-                if (!curPath || curPath === TULING_PATH) patch.ocr_path = BAIDU_PATH
+                if (!curBase || curBase === TULING_BASE || curBase === XFYUN_BASE)
+                  patch.ocr_base_url = BAIDU_BASE
+                if (!curPath || curPath === TULING_PATH || curPath === XFYUN_PATH)
+                  patch.ocr_path = BAIDU_PATH
                 if (!form.getFieldValue('ocr_token_path')) {
                   patch.ocr_token_path = BAIDU_TOKEN_PATH
                 }
+              } else if (v === 'xfyun') {
+                if (!curBase || curBase === TULING_BASE || curBase === BAIDU_BASE)
+                  patch.ocr_base_url = XFYUN_BASE
+                if (!curPath || curPath === TULING_PATH || curPath === BAIDU_PATH)
+                  patch.ocr_path = XFYUN_PATH
               } else {
-                if (!curBase || curBase === BAIDU_BASE) patch.ocr_base_url = TULING_BASE
-                if (!curPath || curPath === BAIDU_PATH) patch.ocr_path = TULING_PATH
+                if (!curBase || curBase === BAIDU_BASE || curBase === XFYUN_BASE)
+                  patch.ocr_base_url = TULING_BASE
+                if (!curPath || curPath === BAIDU_PATH || curPath === XFYUN_PATH)
+                  patch.ocr_path = TULING_PATH
               }
               if (Object.keys(patch).length) form.setFieldsValue(patch)
             }}
@@ -344,7 +375,13 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
           name="ocr_base_url"
         >
           <Input
-            placeholder={ocrProv === 'baidu' ? 'https://aip.baidubce.com' : 'http://223.111.149.152:8090'}
+            placeholder={
+              ocrProv === 'baidu'
+                ? 'https://aip.baidubce.com'
+                : ocrProv === 'xfyun'
+                  ? 'https://api.xf-yun.com'
+                  : 'http://223.111.149.152:8090'
+            }
           />
         </Form.Item>
         <Space size={10} style={{ width: '100%' }}>
@@ -353,7 +390,9 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
               placeholder={
                 ocrProv === 'baidu'
                   ? '/rest/2.0/ocr/v1/general_basic（通用文字识别）'
-                  : '/tuling/uocr/v2/recognize'
+                  : ocrProv === 'xfyun'
+                    ? '/v1/private/hh_ocr_recognize_doc（通用文字识别 intsig）'
+                    : '/tuling/uocr/v2/recognize'
               }
             />
           </Form.Item>
@@ -392,6 +431,40 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
               百度智能云通用文字识别：用 API Key / Secret Key 换取 access_token（缓存至过期前 5
               分钟自动刷新），图片以 base64 表单提交。免费额度与 QPS 限制以控制台为准；
               高精度版可将接口路径改为 /rest/2.0/ocr/v1/accurate_basic。
+            </Typography.Paragraph>
+          </>
+        ) : ocrProv === 'xfyun' ? (
+          <>
+            <Space size={10} style={{ width: '100%' }}>
+              <Form.Item
+                label="AppID"
+                name="ocr_xfyun_app_id"
+                style={{ flex: 1, minWidth: 160 }}
+              >
+                <Input placeholder="讯飞开放平台应用 AppID" autoComplete="off" />
+              </Form.Item>
+              <Form.Item
+                label="APIKey"
+                name="ocr_xfyun_api_key"
+                style={{ flex: 1, minWidth: 200 }}
+                extra={configured.ocr_xfyun_api_key ? '已保存密钥，留空表示不修改' : undefined}
+              >
+                <Input.Password placeholder="讯飞开放平台 APIKey" autoComplete="new-password" />
+              </Form.Item>
+              <Form.Item
+                label="APISecret"
+                name="ocr_xfyun_api_secret"
+                style={{ flex: 1, minWidth: 200 }}
+                extra={configured.ocr_xfyun_api_secret ? '已保存密钥，留空表示不修改' : undefined}
+              >
+                <Input.Password placeholder="讯飞开放平台 APISecret" autoComplete="new-password" />
+              </Form.Item>
+            </Space>
+            <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginTop: -8 }}>
+              讯飞开放平台通用文字识别
+              intsig（支持印刷体与手写体、52 种语言）：请求 URL 按 hmac-sha256
+              签名（host/date/authorization，服务器时钟偏差需小于 5
+              分钟），图片以 base64 JSON 提交（≤4M）。免费额度与并发限制以控制台为准。
             </Typography.Paragraph>
           </>
         ) : (

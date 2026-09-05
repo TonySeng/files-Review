@@ -58,3 +58,4 @@ backend/monitor_*.py
 backend/probe_*.py
 backend/smoke_*.py
 backend/e2e_verify.*
+universal_character_recognition_python_demo.zip

@@ -647,6 +647,7 @@ export const api = {
     apiKey?: string,
     secretKey?: string,
     provider?: string,
+    appId?: string,
   ) {
     return request<{ ok: boolean; message: string; detail?: unknown }>('/settings/test', {
       method: 'POST',
@@ -656,6 +657,7 @@ export const api = {
         api_key: apiKey,
         secret_key: secretKey,
         provider,
+        app_id: appId,
       }),
     })
   },

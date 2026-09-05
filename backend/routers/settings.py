@@ -34,6 +34,8 @@ async def update_settings(
         "kb_api_key",
         "ocr_api_key",
         "ocr_secret_key",
+        "ocr_xfyun_api_key",
+        "ocr_xfyun_api_secret",
     ):
         if patch.get(key) in (None, "", "***"):
             patch.pop(key, None)
@@ -74,18 +76,28 @@ async def test_connection(
     # 仅当传入“有效”（非空且非脱敏占位符）才临时覆盖，否则沿用已保存配置
     if req.base_url and req.base_url != MASKED and url_key:
         overrides[url_key] = req.base_url
-    # 百度 OCR 等 AK/SK 双密钥服务：secret_key 一并临时覆盖，便于“先测后存”
-    if (
-        req.target == "ocr"
-        and req.secret_key
-        and req.secret_key != MASKED
-    ):
-        overrides["ocr_secret_key"] = req.secret_key
+
+    # OCR 各服务的密钥字段不同：baidu=ocr_api_key/ocr_secret_key；xfyun=ocr_xfyun_*(三元组)。
+    # provider 未显式传入时按已保存配置判定，保证「保存后回显 *** 仍可重测」。
+    if req.target == "ocr":
+        prov = (req.provider or str(config.get("ocr_provider") or "tuling")).strip().lower()
+        if prov == "xfyun":
+            if req.api_key and req.api_key != MASKED:
+                overrides["ocr_xfyun_api_key"] = req.api_key
+            if req.secret_key and req.secret_key != MASKED:
+                overrides["ocr_xfyun_api_secret"] = req.secret_key
+            if req.app_id and req.app_id != MASKED:
+                overrides["ocr_xfyun_app_id"] = req.app_id
+        elif prov == "baidu":
+            if req.api_key and req.api_key != MASKED:
+                overrides["ocr_api_key"] = req.api_key
+            if req.secret_key and req.secret_key != MASKED:
+                overrides["ocr_secret_key"] = req.secret_key
+    elif secret_key and req.api_key and req.api_key != MASKED:
+        overrides[secret_key] = req.api_key
     # 服务类型切换后未保存即测试：临时生效，避免用旧 provider 跑出一个误导性结果
     if req.target == "ocr" and req.provider:
         overrides["ocr_provider"] = req.provider
-    if req.api_key and req.api_key != MASKED and secret_key:
-        overrides[secret_key] = req.api_key
     # 兼容旧前端：web_search 曾把 api key 放在 base_url 字段
     if (
         req.target == "web_search"

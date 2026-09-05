@@ -285,6 +285,9 @@ class ConfigUpdate(BaseModel):
     ocr_api_key: str | None = None
     ocr_secret_key: str | None = None
     ocr_token_path: str | None = None
+    ocr_xfyun_app_id: str | None = None
+    ocr_xfyun_api_key: str | None = None
+    ocr_xfyun_api_secret: str | None = None
     ocr_timeout: int | None = None
     kb_base_url: str | None = None
     kb_id: str | None = None
@@ -331,8 +334,9 @@ class ConnectionTestRequest(BaseModel):
     target: Literal["llm", "ocr", "kb", "web_search"]
     base_url: str | None = None
     api_key: str | None = None
-    secret_key: str | None = None  # 需要 AK/SK 双密钥的服务（如百度 OCR）
-    provider: str | None = None  # OCR 服务类型（tuling / baidu），先测后存时临时生效
+    secret_key: str | None = None  # 需要 AK/SK 双密钥的服务（如百度 OCR / 讯飞 OCR 的 APISecret）
+    app_id: str | None = None  # 讯飞 OCR 等需要 AppID 的服务，先测后存时临时生效
+    provider: str | None = None  # OCR 服务类型（tuling / baidu / xfyun），先测后存时临时生效
 
 
 # --------------------------------------------------------------------------- #

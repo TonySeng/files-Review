@@ -1,4 +1,4 @@
-"""OCR 客户端（支持两种服务）。
+"""OCR 客户端（支持三种服务）。
 
 1) 图聆云（tuling，免鉴权，multipart 上传）
   POST {base}{path}  默认 /tuling/uocr/v2/recognize
@@ -16,17 +16,30 @@
             响应: {"words_result":[{"words":"..."}], "words_result_num":N}
                   失败: {"error_code":17,"error_msg":"..."}
 
+3) 讯飞开放平台 通用文字识别 intsig（xfyun，hmac-sha256 签名鉴权，JSON 请求体）
+  请求: POST {base}{path} 默认 https://api.xf-yun.com/v1/private/hh_ocr_recognize_doc
+        URL 携带鉴权 query（host/date/authorization，date 为 RFC1123 GMT，允许 ±300s 偏移）
+        body: {"header":{"app_id","status":3},
+               "parameter":{"<服务名>":{"recognizeDocumentRes":{"encoding":"utf8","compress":"raw","format":"json"}}},
+               "payload":{"image":{"encoding":"png|jpg","image":<base64>,"status":3}}}
+  响应: {"header":{"code":0,"message":"success"},
+         "payload":{"recognizeDocumentRes":{"text":<base64>}}}
+        text base64 解码后为 {"whole_text":"...", "lines":[{"text":"..."}], ...}
+
 新增 provider 只需在此实现 _recognize_xxx 并登记到 _PROVIDERS。
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import time
 import urllib.parse
 import uuid
+from email.utils import formatdate
 from typing import Any
 
 import httpx
@@ -145,7 +158,7 @@ _TOKEN_SKEW = 300
 
 
 def provider() -> str:
-    """当前 OCR 服务类型：tuling | baidu。"""
+    """当前 OCR 服务类型：tuling | baidu | xfyun。"""
     return str(config.get("ocr_provider", "tuling") or "tuling").strip().lower()
 
 
@@ -366,9 +379,167 @@ async def _recognize_baidu(
     return _extract_text(payload)
 
 
+# ---- 讯飞开放平台 通用文字识别 intsig（xfyun） ----
+_XF_BASE = "https://api.xf-yun.com"
+_XF_PATH = "/v1/private/hh_ocr_recognize_doc"
+# 其他 provider 的默认路径：provider 切到 xfyun 但路径未同步时，自动回落到讯飞默认
+_XF_FOREIGN_PATHS = ("/tuling/", "/rest/2.0/ocr/")
+
+
+def _xfyun_url() -> str:
+    """拼装讯飞请求地址（base + path，均为空/为其他服务默认值时回落讯飞默认）。"""
+    base = str(config.get("ocr_base_url", "") or "").rstrip("/")
+    path = str(config.get("ocr_path", "") or "")
+    if not base or base.startswith("http://223.111.149.152") or base == "https://aip.baidubce.com":
+        base = _XF_BASE
+    if not path or path.startswith(_XF_FOREIGN_PATHS):
+        path = _XF_PATH
+    if not path.startswith("/"):
+        path = "/" + path
+    return base + path
+
+
+def _xfyun_signed_url(url: str, api_key: str, api_secret: str) -> str:
+    """按讯飞开放平台规则在 URL 上附加鉴权 query（host/date/authorization）。
+
+    date 必须为 RFC1123 GMT 格式（formatdate(usegmt=True) 恒取 UTC，与时区无关）；
+    signature = hmac-sha256("host: {host}\\ndate: {date}\\nPOST {path} HTTP/1.1", apiSecret)。
+    服务端允许 ±300 秒时钟偏移。
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc
+    path = parsed.path or "/"
+    date = formatdate(usegmt=True)
+    signature_origin = f"host: {host}\ndate: {date}\nPOST {path} HTTP/1.1"
+    signature = base64.b64encode(
+        hmac.new(api_secret.encode("utf-8"), signature_origin.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
+    authorization_origin = (
+        f'api_key="{api_key}", algorithm="hmac-sha256", '
+        f'headers="host date request-line", signature="{signature}"'
+    )
+    authorization = base64.b64encode(authorization_origin.encode("utf-8")).decode("utf-8")
+    query = urllib.parse.urlencode({"host": host, "date": date, "authorization": authorization})
+    return f"{url}?{query}"
+
+
+def _xfyun_text(result_json: Any) -> str:
+    """从 text 解码后的结果 JSON 提取全文：优先 whole_text，缺省再按行拼接。"""
+    if not isinstance(result_json, dict):
+        return ""
+    whole = str(result_json.get("whole_text") or "").strip()
+    if whole:
+        return whole
+    lines = [
+        str((item or {}).get("text") or "").strip()
+        for item in (result_json.get("lines") or [])
+        if isinstance(item, dict)
+    ]
+    return "\n".join(x for x in lines if x)
+
+
+async def _recognize_xfyun(
+    image_bytes: bytes, filename: str, client: httpx.AsyncClient
+) -> str:
+    """讯飞 通用文字识别 intsig：hmac-sha256 URL 签名 + JSON 请求体。"""
+    app_id = str(config.get("ocr_xfyun_app_id", "") or "").strip()
+    api_key = str(config.get("ocr_xfyun_api_key", "") or "").strip()
+    api_secret = str(config.get("ocr_xfyun_api_secret", "") or "").strip()
+    if not app_id or not api_key or not api_secret:
+        raise OCRError(
+            "讯飞 OCR 未配置 AppID / APIKey / APISecret，请在「服务配置 → OCR 服务」中填写后保存"
+        )
+
+    timeout = httpx.Timeout(float(config.get("ocr_timeout", 60)), connect=15.0)
+    url = _xfyun_signed_url(_xfyun_url(), api_key, api_secret)
+
+    # 讯飞限制：图片 base64 后 ≤4M，提交前统一压缩（与百度同规格）
+    data = _fit_image(image_bytes)
+    encoding = "png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "jpg"
+    body = {
+        "header": {"app_id": app_id, "status": 3},
+        "parameter": {
+            "hh_ocr_recognize_doc": {
+                "recognizeDocumentRes": {"encoding": "utf8", "compress": "raw", "format": "json"}
+            }
+        },
+        "payload": {
+            "image": {
+                "encoding": encoding,
+                "image": base64.b64encode(data).decode("ascii"),
+                "status": 3,
+            }
+        },
+    }
+
+    try:
+        resp = await client.post(
+            url,
+            json=body,
+            headers={"Content-Type": "application/json", "host": urllib.parse.urlparse(url).netloc},
+            timeout=timeout,
+        )
+    except httpx.HTTPError as exc:
+        raise OCRError(f"OCR 请求失败: {exc}") from exc
+
+    # 注意：讯飞的业务级错误（如 11201 授权不足）会包在 HTTP 500 里返回
+    # （与百度 HTTP 200 + error_code 不同），需先尝试解析业务 header 再按 HTTP 错误兜底。
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = None
+
+    if payload and isinstance(payload.get("header"), dict):
+        header = payload["header"]
+        code = header.get("code")
+        if code not in (0, "0"):
+            hint = {
+                10005: "appid 在黑名单中或非法",
+                10010: "授权额度不足（套餐过期或已用尽，请到讯飞控制台查看）",
+                10105: "认证失败（AppID / APIKey / APISecret 不匹配）",
+                10163: "请求参数异常（请检查 payload 结构与图片编码）",
+                11200: "该 AppID 未开通此能力授权或业务量超限（请到讯飞控制台领取/开通「通用文字识别 intsig」）",
+                11201: "授权不足：日流控超限，当日调用次数已达上限（免费额度每日有限，可提交应用审核提额或购买套餐）",
+                11202: "授权不足：秒级流控超限（并发超过授权路数）",
+                11203: "授权不足：并发流控超限（并发路数超过授权限制）",
+                11204: "授权请求过多（请稍后重试）",
+            }.get(int(code) if isinstance(code, int) or str(code).isdigit() else -1)
+            raise OCRError(
+                f"OCR 业务失败[{code}] {header.get('message') or '未知错误'}"
+                + (f"（{hint}）" if hint else "")
+            )
+        if resp.status_code >= 400:
+            raise OCRError(
+                f"OCR 返回 {resp.status_code} 但业务码为 0: {resp.text[:200]}"
+            )
+
+    if resp.status_code >= 400:
+        hint = ""
+        if resp.status_code == 401:
+            hint = "（检查 AppID / APIKey / APISecret 是否正确）"
+        elif resp.status_code == 403:
+            hint = "（服务器时钟偏差超过 300 秒，请校准系统时间）"
+        raise OCRError(f"OCR 返回 {resp.status_code}: {resp.text[:200]}{hint}")
+
+    if payload is None:
+        raise OCRError(f"OCR 响应非 JSON: {resp.text[:200]}")
+
+    block = (payload.get("payload") or {}).get("recognizeDocumentRes") or {}
+    text_b64 = str(block.get("text") or "")
+    if not text_b64:
+        raise OCRError("OCR 响应缺少 recognizeDocumentRes.text 数据")
+    try:
+        result_json = json.loads(base64.b64decode(text_b64).decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - 解码失败给出原文片段便于排查
+        raise OCRError(f"OCR 结果 text 解码失败: {exc}（原文片段: {text_b64[:80]}）") from exc
+
+    return _xfyun_text(result_json)
+
+
 _PROVIDERS = {
     "tuling": _recognize_tuling,
     "baidu": _recognize_baidu,
+    "xfyun": _recognize_xfyun,
 }
 
 
@@ -427,7 +598,7 @@ async def test_connection() -> dict[str, Any]:
             return {"ok": False, "message": f"鉴权失败：{exc}"}
     try:
         text = await recognize(png, filename="probe.png")
-        label = {"tuling": "图聆云", "baidu": "百度智能云"}.get(prov, prov)
+        label = {"tuling": "图聆云", "baidu": "百度智能云", "xfyun": "讯飞开放平台"}.get(prov, prov)
         return {
             "ok": True,
             "message": f"{label} OCR 连接正常",

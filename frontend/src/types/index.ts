@@ -567,6 +567,9 @@ export interface AppConfig {
   ocr_api_key: string
   ocr_secret_key: string
   ocr_token_path: string
+  ocr_xfyun_app_id: string
+  ocr_xfyun_api_key: string
+  ocr_xfyun_api_secret: string
   ocr_timeout: number
   kb_base_url: string
   kb_id: string

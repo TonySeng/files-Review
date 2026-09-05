@@ -40,6 +40,103 @@ class OCRError(RuntimeError):
     pass
 
 
+# 百度图片限制：base64 编码后 ≤4M、最长边 ≤8192、最短边 ≥15
+_BAIDU_MAX_B64 = 4 * 1024 * 1024
+_BAIDU_MAX_SIDE = 4096  # 硬限 8192，保守取 4096 兼顾识别耗时
+_BAIDU_MIN_SIDE = 15
+
+# 内嵌探活兜底图（无 PyMuPDF 时使用；百度对无文字小图会返回 216630，故优先动态生成）
+_FALLBACK_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAADIAAAAWCAYAAAAQgLTMAAAAf0lEQVR4nO3XMQqAMAyF4b/"
+    "gLTyF4hm8hVdwdhLBRRAcBEEQBEEQBEEQBEEQBEEQBEEQ5CV5hEAgH7wkTdMkTdM0TdM0"
+    "TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0"
+    "TdM0TdM0TdM0TdM0TdMcbwEDAAH/2m8kAAAAAElFTkSuQmCC"
+)
+
+
+def _fitz():
+    """惰性获取 PyMuPDF（文档解析已依赖，缺失时不阻断 OCR 其他 provider）。"""
+    try:
+        import fitz  # PyMuPDF
+
+        return fitz
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def probe_image_bytes() -> bytes:
+    """生成一张带清晰文字的探活图。
+
+    百度对无文字/过小/纯色图片统一返回 216630 recognize error，用历史那张
+    50×22 的杂点小图探活必然失败。这里用 PyMuPDF 渲染白底黑字（内置中文字体，
+    无需外部字体文件），内容含中文与英数，任一被识别即可判定链路可用。
+    """
+    fitz = _fitz()
+    if fitz is None:
+        return _FALLBACK_PNG
+    try:
+        doc = fitz.open()
+        try:
+            page = doc.new_page(width=440, height=170)
+            page.insert_text(
+                (36, 72), "OCR 连通性测试", fontname="china-s", fontsize=30, color=(0, 0, 0)
+            )
+            page.insert_text(
+                (36, 124), "OCR TEST 12345", fontname="helv", fontsize=26, color=(0, 0, 0)
+            )
+            return page.get_pixmap(dpi=200).tobytes("png")
+        finally:
+            doc.close()
+    except Exception as exc:  # noqa: BLE001 - 探活图生成失败不应阻断连通性检测
+        logger.warning("生成探活图失败，回退内嵌图片: %s", exc)
+        return _FALLBACK_PNG
+
+
+def _fit_image(image_bytes: bytes) -> bytes:
+    """把图片压到百度限制内（base64 ≤4M、长边 ≤4096），超限自动降采样/转 JPEG。
+
+    PDF 扫描页按 dpi=200 渲染后常为 1~3MB，base64 膨胀 33% 会直接撞 4M 上限
+    导致 216201/216630；扫描件多为黑白文字页，转 JPEG 可在不降分辨率的前提下
+    大幅瘦身，仍超限再逐级降采样。
+    """
+    fitz = _fitz()
+    if fitz is None:
+        return image_bytes
+    try:
+        pix = fitz.Pixmap(image_bytes)
+        longest = max(pix.width, pix.height)
+        if longest > _BAIDU_MAX_SIDE:
+            while (
+                max(pix.width, pix.height) > _BAIDU_MAX_SIDE
+                and min(pix.width, pix.height) // 2 >= _BAIDU_MIN_SIDE
+            ):
+                pix.shrink(1)  # 边长减半
+
+        data = pix.tobytes("png")
+        if len(data) * 4 // 3 <= _BAIDU_MAX_B64:
+            return data
+
+        # 体积仍超限：优先转 JPEG 保住分辨率
+        try:
+            jpg = pix.tobytes("jpg")
+            if len(jpg) * 4 // 3 <= _BAIDU_MAX_B64:
+                return jpg
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 最后手段：逐级降采样后重编码
+        while (
+            len(data) * 4 // 3 > _BAIDU_MAX_B64
+            and min(pix.width, pix.height) // 2 >= _BAIDU_MIN_SIDE
+        ):
+            pix.shrink(1)
+            data = pix.tobytes("png")
+        return data
+    except Exception as exc:  # noqa: BLE001 - 压缩失败时按原图提交，交由百度裁定
+        logger.warning("OCR 图片预处理失败，按原图提交: %s", exc)
+        return image_bytes
+
+
 # access_token 缓存（百度）：{api_key: (token, 过期时间戳)}
 _token_cache: dict[str, tuple[str, float]] = {}
 _token_lock = asyncio.Lock()
@@ -116,7 +213,10 @@ def _check_baidu_error(payload: dict[str, Any]) -> None:
         216015: "模块关闭",
         216100: "非法参数",
         216101: "参数数量不够",
-        216630: "识别错误",
+        216201: "图片格式错误",
+        216202: "图片大小超限（base64 后需 ≤4M）",
+        216630: "识别错误（图片可能无文字、分辨率过低或格式不受支持）",
+        216631: "识别银行卡错误",
         282810: "图片识别失败",
     }.get(int(code) if isinstance(code, int) or str(code).isdigit() else -1)
     raise OCRError(f"OCR 业务失败[{code}] {msg}" + (f"（{hint}）" if hint else ""))
@@ -227,10 +327,12 @@ async def _recognize_baidu(
     async def call(token: str) -> httpx.Response:
         url = _url()
         sep = "&" if "?" in url else "?"
+        # 提交前压缩到百度限制内（base64 ≤4M / 长边 ≤4096），避免大页面图被拒
+        payload = _fit_image(image_bytes)
         return await client.post(
             f"{url}{sep}access_token={urllib.parse.quote(token)}",
             data={
-                "image": base64.b64encode(image_bytes).decode("ascii"),
+                "image": base64.b64encode(payload).decode("ascii"),
                 # 可选参数：通用场景不做方向检测/语言自动判定，减少误判
                 "detect_direction": "false",
             },
@@ -314,13 +416,8 @@ async def recognize_many(images: list[bytes]) -> list[str]:
 
 
 async def test_connection() -> dict[str, Any]:
-    """用一张带文字的小图探活。"""
-    png = base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAADIAAAAWCAYAAAAQgLTMAAAAf0lEQVR4nO3XMQqAMAyF4b/"
-        "gLTyF4hm8hVdwdhLBRRAcBEEQBEEQBEEQBEEQBEEQBEEQBEEQ5CV5hEAgH7wkTdMkTdM0TdM0"
-        "TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0TdM0"
-        "TdM0TdM0TdM0TdM0TdMcbwEDAAH/2m8kAAAAAElFTkSuQmCC"
-    )
+    """用一张带清晰文字的探活图检测连通性（百度对无文字小图会返回 216630）。"""
+    png = probe_image_bytes()
     prov = provider()
     if prov == "baidu":
         # 百度先用 AK/SK 换取 token 校验鉴权，再实际识别一次，两段错误分开提示

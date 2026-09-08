@@ -119,6 +119,25 @@ ENUM_REFERENCE = """
 ### 一致性核查结论（跨文件要素比对）
 `inconsistency_rate`（0~1，越高越不一致）、`rule_drifted`（bool，规则内容是否相对存证基线漂移）、
 `deterministic_ratio`（结构化引擎锁定的确定性结论占比，越高结果越稳定）。
+
+### 原文定位（Finding.locations）
+锚点在正文中真正命中的审核结论才携带 `locations[]`；完整性检查等不涉及原文定位的
+结论**不返回该字段**；`status="pass"`（通过）的结论**恒不携带 locations**（含历史
+缓存回放，后端会统一剥离）——「未发现违规」类结论没有原文位置可言，消费方可直接
+用「有无 locations 且 status≠pass」判断可定位性：
+
+| 字段 | 说明 |
+|---|---|
+| `file_id` | 源文件 ID；`GET /api/files/{file_id}` 返回原始文件字节（支持 PDF/Word/Excel） |
+| `filename` / `ext` | 文件名（以文件记录真实名为准）与扩展名（pdf/docx/xlsx…），用于选择预览方式 |
+| `page` / `page_label` / `page_count` | 锚点所在页码（PDF 为真实页码）、页标签与总页数；无页标记文档为单页（page=1） |
+| `char_start` / `char_end` | 锚点在提取全文中的绝对字符下标，与 `GET /api/files/{file_id}/preview?start=&end=` 同口径，用于页内高亮 |
+| `snippet` | 命中的原文片段 |
+| `matched` / `match_type` | 恒为 `true`（未命中的条目不返回）；`exact` 精确 / `normalized` 忽略空白与全角差异 / `fuzzy` 近似（模型改写） |
+| `rects` | **PDF 专属**：锚点在原始页面上的矩形坐标数组 `[{page, x0, y0, x1, y1}]`，PDF 坐标系（原点左下、y 向上，单位 pt），与 PDF.js `viewport.convertToViewportRectangle` 直接兼容，可用于绘制高亮框 |
+
+调用流程：用 `file_id` 取原始文件 → PDF 按 `page` 渲染目标页并用 `rects`（或 `snippet`
+文本检索）绘制高亮；Word/Excel 用网页组件渲染后按 `snippet` 高亮。
 """
 
 # ---------------------------------------------------------------------------
@@ -243,7 +262,14 @@ reg("/api/review/tasks/{task_id}", "get",
                               "差异率11.99%（阈值10.00%，以A为分母），R≥10% → pass",
                     "evidence": "第1页「暂估价(万元) 172.7」；第2页「中标价格152.000000万元」",
                     "location": "评标报告.docx 第1页/第2页", "suggestion": "",
-                    "legal_basis": "", "involved_files": ["评标报告.docx"], "confidence": 1.0}]})}}})
+                    "legal_basis": "", "involved_files": ["评标报告.docx"],
+                    "locations": [
+                        {"file_id": "f-20260908-001", "filename": "评标报告.docx",
+                         "ext": "docx", "page": 1, "page_label": "第1页", "page_count": 5,
+                         "char_start": 36, "char_end": 59,
+                         "snippet": "暂估价(万元) 172.7",
+                         "matched": True, "match_type": "exact", "rects": []}],
+                    "confidence": 1.0}]})}}})
 
 reg("/api/review/tasks", "get",
     responses={"200": {"application/json": {"任务列表": ("分页任务列表",

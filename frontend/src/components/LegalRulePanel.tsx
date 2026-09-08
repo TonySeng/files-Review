@@ -794,11 +794,11 @@ function CreateModal({
           <Alert
             type={preview.truncated ? 'warning' : 'info'}
             showIcon
-            message={`预计切分为 ${preview.chunks} 块（${preview.split_mode}），最多生成 ${preview.max_rules} 条规则`}
+            message={`预计切分为 ${preview.chunks} 块（${preview.split_mode}），解析结果全量保存`}
             description={
               preview.truncated
-                ? `源文件 ${preview.total_chars} 字超过处理上限，将截断处理。`
-                : `源文件共 ${preview.total_chars} 字。`
+                ? `源文件 ${preview.total_chars} 字超过处理上限，将截断处理。创建审核任务时默认按分数选取前 ${preview.max_rules} 条参与审核。`
+                : `源文件共 ${preview.total_chars} 字，抽取的规则全量保存、不截断；创建审核任务时默认按分数选取前 ${preview.max_rules} 条参与审核。`
             }
           />
         )}

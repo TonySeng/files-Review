@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
-# 把部署包拷贝到 131 服务器并拉起（默认使用最新 final17 包）
+# 把部署包拷贝到 131 服务器并拉起（默认使用最新 final25 包）
 # ------------------------------------------------------------
 # 用法：
-#   1) 在本机执行 ./make-deploy-package.sh 生成部署包（当前= final17）
+#   1) 在本机执行 ./make-deploy-package.sh 生成部署包（当前= final25）
 #   2) 编辑下方 SERVER_IP / SERVER_USER（或执行时用环境变量传入）
 #   3) 执行 ./transfer-to-131.sh
 #
@@ -20,7 +20,7 @@ SSH_PORT="${SSH_PORT:-22}"
 REMOTE_DIR="${REMOTE_DIR:-/opt}"    # 远端目标父目录（解压后位于 $REMOTE_DIR/bidding-review-deploy）
 # ====================
 
-TARBALL="${TARBALL:-bidding-review-arm64-final17.tar.gz}"
+TARBALL="${TARBALL:-bidding-review-arm64-final25.tar.gz}"
 PKG_DIR="bidding-review-deploy"
 DEPLOY_MODE="${DEPLOY_MODE:-compose}"   # compose | docker
 

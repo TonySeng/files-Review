@@ -20,7 +20,7 @@ cd "$(dirname "$0")"
 ROOT="$(pwd)"
 
 PKG="bidding-review-deploy"
-FINAL="bidding-review-arm64-final17"
+FINAL="bidding-review-arm64-final25"
 
 echo "=================================================="
 echo " 重新生成部署包: $FINAL"
@@ -41,14 +41,14 @@ echo ">> 刷新后端源码（保留 arm64 Dockerfile + requirements）..."
 for d in models routers services; do
   if [ -d "$PKG/backend/$d" ]; then mv "$PKG/backend/$d" "/tmp/old_pkg_backend_$d.$STAMP"; fi
 done
-for f in config.py main.py __init__.py __main__.py openapi_enrich.py; do
+for f in config.py main.py __init__.py __main__.py openapi_enrich.py gen_decision_rules.py; do
   if [ -f "$PKG/backend/$f" ]; then mv "$PKG/backend/$f" "/tmp/old_pkg_backend_$f.$STAMP"; fi
 done
 
 # tar 管道：从当前 backend/ 复制指定目录与文件，排除缓存
 ( cd backend && tar cf - --exclude='__pycache__' --exclude='*.pyc' \
     models routers services storage storage_config.example.json \
-    config.py main.py __init__.py __main__.py openapi_enrich.py \
+    config.py main.py __init__.py __main__.py openapi_enrich.py gen_decision_rules.py \
   | ( cd "../$PKG/backend" && tar xf - ) )
 echo ">> 后端源码同步完成"
 

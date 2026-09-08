@@ -35,6 +35,7 @@ import type {
   ConsistencyIssue,
   FeedbackJudgment,
   Finding,
+  FindingLocation,
   FindingStatus,
   KBTrace,
   ReviewSummary,
@@ -43,7 +44,30 @@ import type {
   Severity,
 } from '../types'
 import { api } from '../services/api'
-import SnippetViewer from './SnippetViewer'
+import SourcePreviewModal from './SourcePreviewModal'
+
+/** evidence 占位词：参与检索只会随机命中无关单字（如正文里的「无」），不给定位入口 */
+const PLACEHOLDER_EVIDENCE =
+  /^(无|暂无|没有|没有发现|未找到|未提供|未见|无原文|无依据|无相关依据|不适用|n\/a|na|none|-|—|\/)$/i
+
+/** 该结论是否具备「定位原文」入口：
+ * 1) 结构化 locations 中存在真正命中的条目（新任务，后端只返回命中项）；
+ * 2) 无 locations 字段的历史任务但有真实 evidence 摘录（≥6 字且非占位词，
+ *    走统一回退：三级定位→原始文件预览）。
+ * 完整性等不涉及原文定位的结论（locations 为空/无命中且无 evidence）不展示按钮；
+ * 「通过」结论不参与原文定位（未发现违规没有位置可言，evidence 也可能只是「无」）。 */
+function hasLocateEntry(f: {
+  status?: string
+  locations?: FindingLocation[]
+  evidence?: string
+}): boolean {
+  if (f.status === 'pass') return false
+  if (f.locations?.some((l) => l.file_id && l.matched)) return true
+  // 新任务：locations 字段存在（含空数组）说明后端已判定不可定位，不再回退
+  if (f.locations) return false
+  const ev = (f.evidence || '').trim()
+  return ev.length >= 6 && !PLACEHOLDER_EVIDENCE.test(ev)
+}
 
 const STATUS_META: Record<
   FindingStatus,
@@ -96,11 +120,73 @@ export default function ResultPanel({
 }: Props) {
   const [filter, setFilter] = useState<FindingStatus | 'all'>('all')
   const [exporting, setExporting] = useState(false)
-  const [locateState, setLocateState] = useState<{
-    snippet: string
+  // 原始文件预览（PDF 跳页高亮 / Word / Excel 网页渲染 + 自动定位）
+  const [srcLoc, setSrcLoc] = useState<FindingLocation | null>(null)
+  /** 结论定位入口：统一走原始文件预览（所有类型一致），历史任务无 locations 时
+   *  先经后端三级定位换算出 file_id/页码/片段，再打开预览——不再使用旧的
+   *  「提取文本片段查看」模式。 */
+  const openLocate = (f: {
+    status?: string
+    locations?: FindingLocation[]
+    evidence?: string
+    detail?: string
+    title?: string
     location?: string
-    candidates?: string[]
-  } | null>(null)
+  }) => {
+    // 「通过」结论不执行文件预览与定位展示（与后端口径一致：pass ⇒ 无 locations）
+    if (f.status === 'pass') return
+    const target =
+      f.locations?.find((l) => l.file_id && l.matched) || null
+    if (target) {
+      setSrcLoc(target)
+      return
+    }
+    const snippet = f.evidence || ''
+    // 回退检索门禁：evidence 是「无」类占位词或过短摘录时不发检索请求
+    //（单字/短串会在全文随机命中无关位置），直接提示不可定位
+    const evTrim = snippet.trim()
+    if (f.locations || evTrim.length < 6 || PLACEHOLDER_EVIDENCE.test(evTrim)) {
+      message.warning('该结论未提供可核验的原文依据，无法定位原文')
+      return
+    }
+    if (!snippet.trim()) return
+    const candidates = [f.evidence, f.detail, f.title].filter(
+      (s): s is string => Boolean(s && s.trim()),
+    )
+    void (async () => {
+      try {
+        const res = await api.locateSnippet(
+          snippet,
+          fileIds,
+          240,
+          f.location,
+          candidates,
+        )
+        const m = res.matches?.[0]
+        if (!m) {
+          message.warning('未能在原文中定位到该结论')
+          return
+        }
+        // 从定位描述（如「第3页」）解析页码供 PDF 跳页
+        const pmt = /第\s*(\d+)\s*页/.exec(m.location || '')
+        setSrcLoc({
+          file_id: m.file_id,
+          filename: m.filename,
+          ext: m.filename.split('.').pop()?.toLowerCase() || null,
+          page: pmt ? Number(pmt[1]) : null,
+          page_label: pmt ? `第${pmt[1]}页` : null,
+          page_count: null,
+          char_start: m.start,
+          char_end: m.end,
+          snippet: m.matched,
+          matched: true,
+          match_type: m.match_type,
+        })
+      } catch (err) {
+        message.error(err instanceof Error ? err.message : '原文定位失败')
+      }
+    })()
+  }
   // 采纳/不采纳反馈态：key = rule_id
   const [feedbackByRule, setFeedbackByRule] = useState<
     Record<string, { judgment: FeedbackJudgment; reject_reason?: string | null }>
@@ -318,31 +404,25 @@ export default function ResultPanel({
               {row.detail}
             </Typography.Text>
           )}
-          {row.evidence && (
+          {hasLocateEntry(row) && (
             <div className="evidence-block">
               <Space size={6}>
-                <Typography.Text type="secondary" style={{ fontSize: 11.5 }}>
-                  原文依据{row.location ? ` · ${row.location}` : ''}
-                </Typography.Text>
+                {row.evidence && (
+                  <Typography.Text type="secondary" style={{ fontSize: 11.5 }}>
+                    原文依据
+                  </Typography.Text>
+                )}
                 <Button
                   type="link"
                   size="small"
                   icon={<FileSearchOutlined />}
                   style={{ fontSize: 11.5, padding: 0, height: 'auto' }}
-                  onClick={() =>
-                    setLocateState({
-                      snippet: row.evidence,
-                      location: row.location,
-                      candidates: [row.evidence, row.detail, row.title].filter(
-                        (s): s is string => Boolean(s && s.trim()),
-                      ),
-                    })
-                  }
+                  onClick={() => openLocate(row)}
                 >
                   定位原文
                 </Button>
               </Space>
-              <div style={{ marginTop: 3 }}>{row.evidence}</div>
+              {row.evidence && <div style={{ marginTop: 3 }}>{row.evidence}</div>}
             </div>
           )}
           {row.legal_basis && (
@@ -600,15 +680,30 @@ export default function ResultPanel({
                                             {fd.detail}
                                           </Typography.Text>
                                         )}
-                                        {fd.evidence && (
+                                        {hasLocateEntry(fd) && (
                                           <div className="evidence-block" style={{ marginTop: 4 }}>
-                                            <Typography.Text
-                                              type="secondary"
-                                              style={{ fontSize: 11.5 }}
-                                            >
-                                              原文依据{fd.location ? ` · ${fd.location}` : ''}
-                                            </Typography.Text>
-                                            <div style={{ marginTop: 3 }}>{fd.evidence}</div>
+                                            <Space size={6} wrap>
+                                              {fd.evidence && (
+                                                <Typography.Text
+                                                  type="secondary"
+                                                  style={{ fontSize: 11.5 }}
+                                                >
+                                                  原文依据
+                                                </Typography.Text>
+                                              )}
+                                              <Button
+                                                type="link"
+                                                size="small"
+                                                icon={<FileSearchOutlined />}
+                                                style={{ fontSize: 11.5, padding: 0, height: 'auto' }}
+                                                onClick={() => openLocate(fd)}
+                                              >
+                                                定位原文
+                                              </Button>
+                                            </Space>
+                                            {fd.evidence && (
+                                              <div style={{ marginTop: 3 }}>{fd.evidence}</div>
+                                            )}
                                           </div>
                                         )}
                                         {fd.suggestion && (
@@ -853,13 +948,10 @@ export default function ResultPanel({
         </Card>
       )}
 
-      <SnippetViewer
-        open={!!locateState}
-        snippet={locateState?.snippet || ''}
-        location={locateState?.location}
-        candidates={locateState?.candidates}
-        fileIds={fileIds}
-        onClose={() => setLocateState(null)}
+      <SourcePreviewModal
+        open={!!srcLoc}
+        location={srcLoc}
+        onClose={() => setSrcLoc(null)}
       />
 
       <Modal

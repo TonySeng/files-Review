@@ -70,11 +70,13 @@ const APPLIES_OPTIONS = [
 
 function formatTime(iso?: string): string {
   if (!iso) return '-'
-  try {
-    return new Date(iso).toLocaleString('zh-CN', { hour12: false })
-  } catch {
-    return iso
-  }
+  const s = String(iso).trim()
+  // 旧版过程日志只存了「HH:MM:SS」纯时刻：直接展示，不进 Date 解析
+  // （new Date('14:38:22') 返回 Invalid Date，曾导致页面显示 [Invalid Date]）
+  if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) return s
+  const d = new Date(s)
+  if (Number.isNaN(d.getTime())) return s // 解析失败原样展示，绝不输出 Invalid Date
+  return d.toLocaleString('zh-CN', { hour12: false })
 }
 
 export default function LegalRulesManagementPage({ onBack }: Props) {

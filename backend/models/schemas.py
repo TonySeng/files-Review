@@ -181,6 +181,50 @@ class PromptTestRequest(BaseModel):
     send_to_llm: bool = False
 
 
+class LocRect(BaseModel):
+    """PDF 页面上的锚点矩形（PDF 坐标系：原点左下、y 向上，单位 pt）。
+
+    与 PDF.js 的 viewport.convertToViewportRectangle 直接兼容，可用于在
+    原始页面上绘制高亮框。
+    """
+
+    page: int
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+
+class FileLocation(BaseModel):
+    """结构化原文定位信息：一条结论在某份源文件中的位置。
+
+    第三方应用定位流程：拿 file_id 调 GET /api/files/{file_id} 取原始文件字节
+    （PDF 用 page 跳页、rects 绘制高亮框；Word/Excel 用网页组件渲染后按
+    snippet 高亮）；需要页内高亮时也可把 char_start/char_end 传给
+    GET /api/files/{file_id}/preview。
+
+    ⚠️ locations 只包含「真正命中原文」的定位条目：锚点未命中正文（如完整性
+    检查类结论）时该字段不返回，消费方可用「有无 locations」直接判断可定位性。
+    """
+
+    file_id: str | None = None
+    filename: str = ""
+    ext: str | None = None
+    # 页码信息（PDF 按真实页；docx/txt/xlsx 等无页标记文档为单页「全文」，page=1）
+    page: int | None = None
+    page_label: str | None = None
+    page_count: int | None = None
+    # 锚点在提取全文中的绝对字符下标（含端点），与 /preview 的 start/end 参数同口径
+    char_start: int | None = None
+    char_end: int | None = None
+    snippet: str | None = None
+    matched: bool = False
+    # exact=精确命中 normalized=忽略空白/全角差异 fuzzy=近似命中
+    match_type: Literal["exact", "normalized", "fuzzy"] | None = None
+    # PDF 专属：锚点在原始页面上的精确矩形坐标（PDF 坐标系）；非 PDF 或检索失败为 []
+    rects: list[LocRect] = []
+
+
 class Finding(BaseModel):
     rule_id: str
     rule_name: str = ""
@@ -194,6 +238,9 @@ class Finding(BaseModel):
     suggestion: str = ""
     legal_basis: str = ""
     involved_files: list[str] = Field(default_factory=list)
+    # 结构化原文定位：与 involved_files 一一对应（同一文件一条），支持直接加载
+    # 原始文件并自动跳转到页码与内容位置；历史任务/文件已删除时为空或缺 file_id
+    locations: list[FileLocation] = Field(default_factory=list)
     confidence: float = 0.0
     # 错别字类识别的结构化信息（用于校验集去噪与跨审核去重）；非错别字 finding 为 null
     typo: "TypoInfo | None" = None

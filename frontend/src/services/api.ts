@@ -660,6 +660,24 @@ export const api = {
     })
   },
 
+  /** 拉取原始文件字节并转为 object URL（供 PDF iframe / docx-preview / xlsx 解析），由调用方负责 revoke。 */
+  async getFileObjectUrl(fileId: string): Promise<string> {
+    const resp = await fetch(`${BASE}/files/${encodeURIComponent(fileId)}`, {
+      headers: authHeaders(),
+    })
+    if (!resp.ok) {
+      let msg = `文件加载失败 (${resp.status})`
+      try {
+        const body = await resp.json()
+        if (typeof body.detail === 'string') msg = body.detail
+      } catch {
+        /* 保留默认错误 */
+      }
+      throw new Error(msg)
+    }
+    return URL.createObjectURL(await resp.blob())
+  },
+
   getSettings() {
     return request<{ config: AppConfig; defaults: AppConfig }>('/settings')
   },

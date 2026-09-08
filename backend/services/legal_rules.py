@@ -128,11 +128,15 @@ _LOG_MAX = 500  # 极端长法规（上百块）时防记录无限膨胀
 
 
 def _log(rec: dict[str, Any], text: str, level: str = "info") -> None:
-    """追加一条过程日志（调用方需已持有 _lock，或操作的是游离 rec）。"""
+    """追加一条过程日志（调用方需已持有 _lock，或操作的是游离 rec）。
+
+    time 存完整「YYYY-MM-DD HH:MM:SS」——历史版本只存「HH:MM:SS」纯时刻，
+    前端 new Date() 解析为 Invalid Date，页面显示成 [Invalid Date]。
+    """
     logs = rec.setdefault("logs", [])
     logs.append(
         {
-            "time": datetime.now().strftime("%H:%M:%S"),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "text": text,
             "level": level,
         }
@@ -981,25 +985,12 @@ async def _run_mining(rid: str) -> None:
 
         kept, removed = dedup_rules(raw_rules)
         kept.sort(key=_rule_score, reverse=True)
-        max_rules = int(rec.get("params", {}).get("max_rules") or config.get("legal_max_rules", 30))
-        truncated = 0
+        # 全量保存：解析产物不再按 max_rules 截断，保证抽取结果完整可查、可人工筛选。
+        # 「默认审 30 条」的口径移至任务执行时——resolve_rules 按此处的同一分数序取前 N 条。
         _log_rid(
             rid,
             f"合并去重完成：{len(raw_rules)} 条 → {len(kept)} 条（移除 {removed} 条重复）",
         )
-        if len(kept) > max_rules:
-            truncated = len(kept) - max_rules
-            kept = kept[:max_rules]
-            warnings.append(
-                f"抽取到 {len(kept) + truncated} 条规则，超过上限 {max_rules}，"
-                f"已按「严重级别 + 可量化程度」保留前 {max_rules} 条"
-            )
-            _log_rid(
-                rid,
-                f"超过上限 {max_rules} 条，按「严重级别 + 可量化程度」保留前 {max_rules} 条"
-                f"（丢弃 {truncated} 条）",
-                "warn",
-            )
         if errors:
             warnings.append(f"{len(errors)} 个文本块抽取失败，该部分条款未纳入规则集")
             _log_rid(rid, f"{len(errors)} 个文本块抽取失败，该部分条款未纳入规则集", "warn")
@@ -1030,7 +1021,7 @@ async def _run_mining(rid: str) -> None:
                     "raw_rules": len(raw_rules),
                     "dedup_removed": removed,
                     "kept": len(kept),
-                    "truncated": truncated,
+                    "truncated": 0,  # 兼容历史展示字段：现全量保存，不再截断
                     "failed_chunks": len(errors),
                     "elapsed_sec": round(time.monotonic() - t0, 1),
                 }
@@ -1131,7 +1122,7 @@ async def create_ruleset(
             out["reuse_reason"] = reuse_reason
             out["logs"] = [
                 {
-                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "text": f"命中已有解析结果（{reuse_reason}），直接复用，跳过重复解析",
                     "level": "ok",
                 }
@@ -1239,12 +1230,24 @@ def update_ruleset(
 
 
 def resolve_rules(
-    ruleset_ids: list[str], user_id: str | None = None
+    ruleset_ids: list[str],
+    user_id: str | None = None,
+    per_set_limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """把多个临时规则集解析成引擎可直接消费的规则列表（按 id 去重）。
 
+    任务执行口径：每个规则集默认只取前 ``per_set_limit`` 条（按保存时的
+    「严重级别 + 可量化程度」分数降序），默认值取配置 ``legal_max_rules``（30）。
+    解析产物本身是全量保存的，此处只是任务时的默认选取，不影响规则集完整性。
+
     返回 (规则列表, 未找到/无权限的规则集 id 列表)。
     """
+    if per_set_limit is None:
+        try:
+            per_set_limit = int(config.get("legal_max_rules", 30) or 30)
+        except (TypeError, ValueError):
+            per_set_limit = 30
+    per_set_limit = max(1, int(per_set_limit)) if per_set_limit else None
     rules: list[dict[str, Any]] = []
     missing: list[str] = []
     seen: set[str] = set()
@@ -1256,7 +1259,10 @@ def resolve_rules(
         if rec.get("status") != "ready":
             missing.append(rid)
             continue
-        for r in rec.get("rules") or []:
+        set_rules = list(rec.get("rules") or [])
+        if per_set_limit:
+            set_rules = set_rules[:per_set_limit]
+        for r in set_rules:
             rid_ = str(r.get("id") or "")
             if not rid_ or rid_ in seen:
                 continue

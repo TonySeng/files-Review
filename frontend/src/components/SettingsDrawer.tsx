@@ -554,11 +554,11 @@ export default function SettingsDrawer({ open, onClose, onSaved, role, currentUs
         </Divider>
         <Space size={10}>
           <Form.Item
-            label="默认抽取规则条数"
+            label="任务默认审核规则条数"
             name="legal_max_rules"
             extra={
               <span style={{ fontSize: 12 }}>
-                上传法规文件自动生成临时规则集时，默认保留的规则条数上限（按可核查性打分截断），默认 30 条。
+                法规解析结果全量保存、不截断；创建审核任务引用法规规则集时，每个规则集默认按分数取前 N 条参与审核，默认 30 条。
               </span>
             }
           >

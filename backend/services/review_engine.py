@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator
 from .. import config
 from . import consistency_cache, feedback_store, findings_cache, kb_client, llm_client, prompts, rules_store, web_search_client
 from . import sections as sections_store
+from . import text_locator
 from . import versioning
 from .doc_parser import truncate
 
@@ -349,6 +350,23 @@ def _doc_label(doc: dict[str, Any]) -> str:
     return doc.get("file_type_name") or role_label.get(doc.get("role", "bid"), "文件")
 
 
+def _scoped_text(
+    doc: dict[str, Any], defs: list[dict[str, Any]]
+) -> tuple[str, list[str]]:
+    """按章节定义取文档的送审正文。
+
+    优先消费解析阶段预拆分的章节结构（doc_splitter，解析时一次完成），
+    旧文件/拆分失败时回退实时 scope_text 全文重切——两者匹配语义一致。
+    """
+    prepared = doc.get("sections")
+    if isinstance(prepared, list) and prepared:
+        body, names = sections_store.scope_from_prepared(prepared, defs)
+        if body.strip():
+            return body, names
+        # 预拆分结构未命中时再回退实时切分（防拆分产物异常导致漏审）
+    return sections_store.scope_text(doc.get("text") or "", defs)
+
+
 def _section_scoped(
     batch_docs: list[dict[str, Any]], section_ids: list[str]
 ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
@@ -371,7 +389,7 @@ def _section_scoped(
         defs = sections_store.for_file_type(section_ids, doc.get("file_type"))
         if not defs:
             continue  # 该文件类型下没有关联章节 → 本文档不参与本规则审核
-        body, names = sections_store.scope_text(doc.get("text") or "", defs)
+        body, names = _scoped_text(doc, defs)
         if not body.strip():
             continue  # 文档里找不到这些章节 → 本文档不参与
         shown = truncate(body, limit)
@@ -1225,7 +1243,9 @@ def _collect_typos(item: dict[str, Any], rule_id: str) -> list[dict[str, Any]]:
 
 
 def _normalize_findings(
-    raw: Any, batch: list[dict[str, Any]]
+    raw: Any,
+    batch: list[dict[str, Any]],
+    doc_names: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """把模型输出对齐到规则定义，补齐缺失项。
 
@@ -1250,12 +1270,55 @@ def _normalize_findings(
         status = str(item.get("status") or "unknown").lower()
         if status not in ("pass", "fail", "warn", "unknown"):
             status = "unknown"
-        # 方案 C：结构化判定与自由文本矛盾 → 降级 unknown，避免误判不合规。
+        # 方案 C：结构化判定与自由文本矛盾 → 先纠偏、纠偏不了再降级 unknown。
         # 仅对 LLM 结论生效（确定性结论走 _normalize_finding_deterministic，不会被调用到此）。
         contradiction = False
-        if status == "fail" and _finding_text_contradicts_fail(item):
+        corrected_pass = False
+        evidence_missing = False
+        duplicate_unverified = False
+        file_unresolved = False
+        typo_entity = False
+        if status == "fail" and _explicitly_reports_no_violation(item):
+            # 结语句明确「未发现/不存在 + 违规对象」却填 fail → 直接纠正为通过，
+            # 并清空定位类字段（通过结论不携带原文定位，证据「无」无定位意义）。
+            status = "pass"
+            corrected_pass = True
+        elif status == "fail" and _finding_text_contradicts_fail(item):
             status = "unknown"
             contradiction = True
+        elif (
+            status in ("fail", "warn")
+            and _evidence_is_placeholder(item.get("evidence"))
+            and not _finding_has_alternative_basis(item)
+        ):
+            # fail/warn 却给不出原文依据（evidence 为「无」类占位词/空，
+            # detail 也没有引文或缺失类表述）→ 结论纯属模型断言，降级为
+            # 待人工复核，杜绝「没有相关依据也判不合规」。
+            status = "unknown"
+            evidence_missing = True
+        elif status in ("fail", "warn") and _duplicate_claim_unsubstantiated(item):
+            # 断言「重复/雷同」但引用的原文中比对不出任何重复主体 → 降级待人工复核。
+            # 引文保留（真实摘录，供人工核对），仅翻转状态并标注原因。
+            status = "unknown"
+            duplicate_unverified = True
+        elif (
+            status in ("fail", "warn")
+            and doc_names
+            and _unresolved_file_reference(item, doc_names)
+        ):
+            # fail/warn 引用的文件全部解析不到真实送审文件 → 疑似臆造文件/无来源引用，
+            # 降级待人工复核，杜绝「引用不存在的投标文件」这类幻觉结论。
+            status = "unknown"
+            file_unresolved = True
+        elif (
+            status in ("fail", "warn")
+            and str(rule.get("id") or "") in _TYPO_RULE_SCOPE
+            and _typo_claim_is_entity_equivalence(item)
+        ):
+            # 错别字规则把「两个不同的主体名称互为正误」误判为错别字：专有名词不是
+            # 行文错别字，应判定为无错别字(pass)，避免把合法公司名标成错别字。
+            status = "pass"
+            typo_entity = True
         try:
             confidence = float(item.get("confidence") or 0)
         except (TypeError, ValueError):
@@ -1277,6 +1340,19 @@ def _normalize_findings(
             # 错别字类识别的结构化信息（用于校验集去噪）；多错字时下方逐条拆分
             "typo": None,
         }
+        if corrected_pass:
+            # 纠偏为通过：清空定位类字段——「未发现违规」的结论没有原文位置可言，
+            # 保留 evidence（如「无」）只会诱导定位匹配到无关单字（如正文中的「无」）。
+            base["status"] = "pass"
+            base["evidence"] = ""
+            base["location"] = ""
+            base["involved_files"] = []
+            base["status_corrected"] = True
+            base["detail"] = (
+                base["detail"]
+                + "\n\n（系统纠偏：结论文本明确为「未发现违规」，"
+                "模型误标的 fail 已自动纠正为「通过」。）"
+            ).strip()
         if contradiction:
             # 模型结构化字段标 fail，但结论文本自相矛盾（文本倾向 pass/不构成违规）。
             # 降级为「待人工复核」，并在结论中标注，避免把本应通过的结论误判为不合规。
@@ -1286,6 +1362,53 @@ def _normalize_findings(
                 "（文本倾向 pass/不构成违规），已自动降级为「待人工复核」，避免误判不合规。"
             ).strip()
             base["contradiction_detected"] = True
+        if evidence_missing:
+            # fail/warn 无原文依据：清掉占位词 evidence 与定位类字段，交人工复核。
+            base["evidence"] = ""
+            base["location"] = ""
+            base["involved_files"] = []
+            base["evidence_missing"] = True
+            base["detail"] = (
+                base["detail"]
+                + "\n\n⚠️ 模型判定为不合规/存疑，但未提供可核验的原文依据"
+                "（evidence 为「无」类占位词），已自动降级为「待人工复核」，"
+                "请人工核实原文后再判定。"
+            ).strip()
+        if duplicate_unverified:
+            # 重复类断言无实证：引文里比对不出重复主体，状态降级、引文保留。
+            base["duplicate_unverified"] = True
+            base["detail"] = (
+                base["detail"]
+                + "\n\n⚠️ 结论断言存在「重复/雷同」，但对结论引用的原文逐一比对后"
+                "未发现任何实际重复的主体名称，断言缺乏依据，已自动降级为"
+                "「待人工复核」，请人工核实。"
+            ).strip()
+        if file_unresolved:
+            # 引用了本次未送审的文件：结论依据的文件不存在，状态降级、清空定位类字段。
+            base["evidence"] = ""
+            base["location"] = ""
+            base["involved_files"] = []
+            base["file_unresolved"] = True
+            cited = "、".join(str(x) for x in (item.get("involved_files") or []))
+            base["detail"] = (
+                base["detail"]
+                + f"\n\n⚠️ 结论引用的文件「{cited}」不在本次送审文件范围内，"
+                "属于无来源引用，已自动降级为「待人工复核」，请人工核实原文。"
+            ).strip()
+        if typo_entity:
+            # 错别字结论把两个主体名称(公司名)当成正误关系：专有名词不是行文错别字，
+            # 纠正为「通过」(无错别字)，避免把合法公司名称标成错别字。
+            base["status"] = "pass"
+            base["evidence"] = ""
+            base["location"] = ""
+            base["involved_files"] = []
+            base["typo"] = None
+            base["typo_entity_equivalence"] = True
+            base["detail"] = (
+                "（系统纠偏：本条为错别字审查，但结论把两个不同的主体名称"
+                "（如公司名）当作正误关系，专有名词不是行文错别字，已自动判定为"
+                "「通过」。若确属名称笔误请人工在对应业务规则下复核。）"
+            ).strip()
         typos = _collect_typos(item, rule_id)
         if not typos:
             findings.append(base)
@@ -1371,6 +1494,202 @@ def _normalize_finding_deterministic(f: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_LOCATION_MAX_PER_FINDING = 10
+
+
+def _norm_filename(name: str, strip_copy_suffix: bool = False) -> str:
+    """文件名归一化：去扩展名、去空白与全半角差异，用于模糊归属匹配。
+
+    strip_copy_suffix=True 时额外剥去尾部「(1)/(2)」类副本后缀（LLM 写
+    involved_files 时常带下载副本名），作为二级匹配键。
+    """
+    import re as _re
+    import unicodedata as _ud
+
+    s = str(name or "").strip()
+    s = _re.sub(r"\.[A-Za-z0-9]{1,5}$", "", s)
+    if strip_copy_suffix:
+        s = _re.sub(r"[\s(（]*[(（]\d+[)）][\s)）]*$", "", s)
+    s = _ud.normalize("NFKC", s)
+    return _re.sub(r"\s+", "", s).lower()
+
+
+def _pdf_locate_rects(
+    path: str | None, page_no: int | None, snippet: str | None
+) -> list[dict[str, Any]]:
+    """用 PyMuPDF 在 PDF 原始页面上检索锚点，返回精确矩形坐标。
+
+    坐标口径：PDF 坐标系（原点左下、y 向上），与 PDF.js viewport 的
+    convertToViewportRectangle 直接兼容。检索失败（文件缺失/未命中）返回 []，
+    不伪造坐标。
+    """
+    if not path or not snippet or not page_no:
+        return []
+    try:
+        import fitz
+
+        with fitz.open(path) as pdf:
+            if page_no < 1 or page_no > pdf.page_count:
+                return []
+            page = pdf[page_no - 1]
+            # search_for 对空白宽松；依次尝试原文片段 → 压缩空白 → 前缀
+            candidates = [snippet]
+            squeezed = "".join(snippet.split())
+            if squeezed and squeezed != snippet:
+                candidates.append(squeezed)
+            prefix = snippet.strip()[:30]
+            if len(prefix) >= 6 and prefix not in candidates:
+                candidates.append(prefix)
+            rects: list = []
+            for cand in candidates:
+                rects = page.search_for(cand)
+                if rects:
+                    break
+            page_h = page.rect.height
+            return [
+                {
+                    "page": page_no,
+                    "x0": round(r.x0, 2),
+                    "y0": round(page_h - r.y1, 2),  # fitz 原点左下→PDF 原点左下
+                    "x1": round(r.x1, 2),
+                    "y1": round(page_h - r.y0, 2),
+                }
+                for r in rects[:8]
+            ]
+    except Exception:  # 坐标属增强信息，任何失败都不影响定位主流程
+        return []
+
+
+def _attach_locations(
+    findings: list[dict[str, Any]], docs: list[dict[str, Any]]
+) -> None:
+    """为每条结论就地附加结构化原文定位信息 ``locations``。
+
+    定位口径（与 /api/files/locate、/api/files/{id}/preview 完全同源）：
+    - involved_files（文件名）→ 本次审核上传文档映射出 file_id / ext（精确匹配
+      后回退归一化匹配）；filename 一律以文件记录的真实名为准，LLM 写的
+      involved_files 名称可能不精确，不做展示口径；
+    - 锚点文本按 evidence → detail → title 渐进回退，用 text_locator 三级匹配
+      （精确 → 归一化 → 模糊）在提取全文中定位，命中后换算绝对字符下标与页码
+      （PDF 提取文本自带 [第N页] 标记，页码与文档真实页一致）；
+    - PDF 额外用 PyMuPDF 在原始页面检索锚点，给出 rects 精确坐标（PDF 坐标系），
+      供前端/第三方在原始页面上绘制高亮。
+
+    每项结构：{file_id, filename, ext, page, page_label, page_count,
+    char_start, char_end, snippet, matched, match_type, rects}。
+
+    ⚠️ 只附加「真正命中」的定位（matched=True）：完整性检查等不涉及原文定位的
+    结论锚点在正文中无命中，此时**不设置 locations 字段**（而非返回
+    matched=False 的空壳条目），接口消费方可直接用「有无 locations」判断可定位性。
+    """
+    by_name: dict[str, dict[str, Any]] = {}
+    norm_index: dict[str, dict[str, Any]] = {}
+    norm_index2: dict[str, dict[str, Any]] = {}  # 二级键：剥副本后缀
+    for d in docs:
+        name = str(d.get("filename") or "").strip()
+        if not name:
+            continue
+        by_name.setdefault(name, d)  # 同名文件取第一个（上传侧已禁重名）
+        nk = _norm_filename(name)
+        if nk:
+            norm_index.setdefault(nk, d)
+        nk2 = _norm_filename(name, strip_copy_suffix=True)
+        if nk2:
+            norm_index2.setdefault(nk2, d)
+
+    def _resolve(name: str) -> dict[str, Any] | None:
+        doc = by_name.get(name)
+        if doc is not None:
+            return doc
+        return (
+            norm_index.get(_norm_filename(name))
+            or norm_index2.get(_norm_filename(name, strip_copy_suffix=True))
+            or None
+        )
+
+    for f in findings:
+        # involved_files 清洗：模型会编造「项目名称」等表头词/泛称，凡解析不到
+        # 本次审核文档的一律剔除，并以真实文件名回写，避免结果页出现幻觉文件分组。
+        names_all = [str(x) for x in (f.get("involved_files") or []) if str(x).strip()]
+        names: list[str] = []
+        resolved_docs: list[dict[str, Any]] = []
+        for name in names_all[:_LOCATION_MAX_PER_FINDING]:
+            doc = _resolve(name)
+            if doc is None:
+                continue  # 文件已不在本次审核范围 → 不伪造归属
+            real = str(doc.get("filename") or name)
+            if real not in names:
+                names.append(real)
+                resolved_docs.append(doc)
+        f["involved_files"] = names
+        # 通过结论不携带原文定位：「未发现违规」没有位置可言，且其 evidence
+        # 常为「无」之类的占位词，参与定位只会匹配到正文无关单字。已有 locations
+        # 的旧缓存也一并剥离，保证「status=pass ⇒ locations 为空」这一接口不变量。
+        if str(f.get("status") or "") == "pass":
+            f.pop("locations", None)
+            f["location"] = ""  # 通过结论同样不保留臆造的位置文本
+            continue
+        if f.get("locations"):
+            continue  # 已带定位（如缓存回放的旧结构）不重复计算
+        # 锚点候选过滤：过短的候选（如「无」「是」）会在全文里随机命中单字，
+        # 产生错误定位；少于 4 字的候选不参与三级匹配。
+        candidates = [
+            c
+            for c in (f.get("evidence"), f.get("detail"), f.get("title"))
+            if isinstance(c, str) and len(c.strip()) >= 4
+        ]
+        locs: list[dict[str, Any]] = []
+        for doc in resolved_docs:
+            name = str(doc.get("filename") or "")
+            text = str(doc.get("text") or "")
+            if not text.strip():
+                continue
+            if not candidates:
+                continue  # 锚点全是「无」这类占位词 → 无有效定位依据，不产定位
+            hit = text_locator.locate(
+                text,
+                candidates[0],
+                context_chars=0,
+                location=str(f.get("location") or "") or None,
+                candidates=candidates,
+            )
+            if not hit:
+                continue  # 锚点未命中正文（如完整性结论）→ 不产定位
+            pages = text_locator.split_pages(text)
+            pg = text_locator.page_for_offset(pages, hit["start"])
+            loc: dict[str, Any] = {
+                "file_id": doc.get("file_id"),
+                "filename": doc.get("filename") or name,
+                "ext": doc.get("ext"),
+                "matched": True,
+                "match_type": hit.get("match_type"),
+                "char_start": int(hit["start"]),
+                "char_end": int(hit["end"]),
+                "snippet": text[hit["start"] : hit["end"]],
+                "page": int(pg["page"]) if pg else None,
+                "page_label": pg["label"] if pg else None,
+                "page_count": int(pages[-1]["page"]) if pages else None,
+                "rects": [],
+            }
+            # PDF 增强：在原始文件页面上检索精确坐标（失败仅少坐标，不影响主定位）
+            if str(doc.get("ext") or "").lower().lstrip(".") == "pdf":
+                loc["rects"] = _pdf_locate_rects(
+                    doc.get("path"), loc["page"], loc["snippet"]
+                )
+            locs.append(loc)
+        if locs:
+            f["locations"] = locs
+        # 规范化 location 自由文本：模型常写「附件1 和附件2 第1页」这类泛称/臆造位置。
+        # 命中 → 以真实文件名+页码重写；未命中/pass/完整性类 → 清空，不让臆造文本外漏。
+        if locs:
+            first = locs[0]
+            fname = str(first.get("filename") or "")
+            pg = first.get("page")
+            f["location"] = f"{fname} 第{pg}页" if pg else fname
+        else:
+            f["location"] = ""
+
+
 def _aggregate_rule_results(
     findings: list[dict[str, Any]], rules: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -1423,6 +1742,8 @@ def _aggregate_rule_results(
                             "location": str(it.get("location") or ""),
                             "suggestion": str(it.get("suggestion") or ""),
                             "confidence": it.get("confidence"),
+                            # 结构化原文定位（_attach_locations 已在聚合前附加）
+                            "locations": it.get("locations") or [],
                         }
                         for it in its
                     ],
@@ -1597,6 +1918,232 @@ def _pair_is_violation(diff: float, threshold: float, fail_when: str) -> bool:
     return diff <= threshold
 
 
+_NO_VIOLATION_MARKS = (
+    "未发现", "未存在", "不存在", "未见", "未出现", "未涉及",
+    "均符合", "均满足", "符合要求", "满足要求", "不构成",
+)
+# 与违规语义搭配的名词：单独「未发现」不够（可能后面接真实问题），需「未发现+违规对象」
+_VIOLATION_NOUNS = (
+    "违规", "违法", "否决", "不合规", "异常", "问题", "错误", "差错",
+    "缺失", "缺少", "隐瞒", "造假", "弄虚作假", "矛盾", "不一致",
+    "出入", "抵触", "违背", "串标", "围标", "废标", "无效投标",
+)
+# 结语句中出现这些信号说明后半句在报真实问题，不能按「未发现违规」翻转为 pass
+_FAIL_TAIL_MARKS = (
+    "但", "然而", "不过", "已发现", "发现存在", "发现有", "存在", "不足",
+    "超出", "低于", "高于", "遗漏", "未按", "缺少", "逾期", "低于",
+)
+
+# —— 无依据结论防护：fail/warn 但 evidence 是占位词 → 结论没有可核验的原文支撑 ——
+_PLACEHOLDER_EVIDENCE = {
+    "无", "暂无", "没有", "没有发现", "未找到", "未提供", "未见", "未提供原文",
+    "无原文", "无原文依据", "无依据", "无相关依据", "无相关原文", "不适用",
+    "—", "-", "/", "／", "n/a", "na", "none", "null",
+}
+# 缺失/漏附类违规天然没有可摘录的原文（违规内容本身就是「不存在」），
+# detail/title 命中这些标记时不视为「无依据」，保留原判定。
+_ABSENCE_VIOLATION_MARKS = (
+    "缺少", "缺失", "未提供", "未附", "未提交", "未出具", "未签署", "未盖章",
+    "未签字", "遗漏", "未列明", "不齐全", "不完整", "未载明", "未注明", "未标注",
+)
+
+
+def _evidence_is_placeholder(evidence: Any) -> bool:
+    """evidence 是否为「无」类占位词或空串（规范化后比对，忽略标点与大小写）。"""
+    s = str(evidence or "").strip().strip("。．：:，, ；;、").lower()
+    return (not s) or s in _PLACEHOLDER_EVIDENCE
+
+
+def _finding_has_alternative_basis(item: dict[str, Any]) -> bool:
+    """evidence 为占位词时，判断 detail/title 是否自带可核验的判定依据。
+
+    满足任一条即视为「有依据」，不触发降级：
+    - detail/title 报的是缺失/漏附类违规（天然无原文可摘录）；
+    - detail 里带引号原文摘录（「」『』“” 引号内 ≥6 字）。
+    """
+    blob = " ".join([str(item.get("detail") or ""), str(item.get("title") or "")])
+    if any(m in blob for m in _ABSENCE_VIOLATION_MARKS):
+        return True
+    if re.search(r"[「『“\"][^」』”\"]{6,}[」』”\"]", blob):
+        return True
+    return False
+
+
+def _conclusion_sentence(item: dict[str, Any]) -> str:
+    """取结论的「结语句」：detail+title 按句切分后的最后一个非空句。
+
+    模型被要求在 detail 末尾写结论，矛盾纠偏只看结语句，
+    避免被前文「摘录原文」里的字样误触发。
+    """
+    text = " ".join([str(item.get("detail") or ""), str(item.get("title") or "")])
+    parts = [
+        s.strip()
+        for s in re.split(r"[。；;！!？?\n]", text)
+        if s.strip()
+    ]
+    return parts[-1] if parts else text.strip()
+
+
+def _has_non_negated(seg: str, marks: tuple[str, ...]) -> bool:
+    """seg 中是否存在未被「不/未/无」否定的标记词。
+
+    修复子串误伤：「不符合要求」包含「符合要求」、「不存在问题」包含「存在」，
+    若直接用 ``in`` 判断会把真实问题句误判成「未发现违规」而纠偏为 pass。
+    标记词前一字为否定前缀时该次出现不计。
+    """
+    for m in marks:
+        start = 0
+        while True:
+            i = seg.find(m, start)
+            if i < 0:
+                break
+            prev = seg[i - 1] if i > 0 else ""
+            if prev not in ("不", "未", "无"):
+                return True
+            start = i + 1
+    return False
+
+
+# —— 重复类断言无实证防护：fail/warn 断言「重复/雷同」但引文里比对不出重复主体 ——
+# 案例：四个完全不同的公司名称被模型断言「所有投标公司名称均重复」。
+_DUPLICATE_CLAIM_MARKS = (
+    "均重复", "名称重复", "重复投标", "重复的投标", "投标人重复", "重复出现",
+    "相互重复", "存在重复", "雷同", "完全相同", "高度雷同",
+)
+# 主体名称 token（公司/机构等），非贪婪前缀 + 常见组织后缀
+_ENTITY_TOKEN_RE = re.compile(
+    r"[\u4e00-\u9fa5A-Za-z0-9（）()·]{3,40}?"
+    r"(?:股份有限公司|有限责任公司|有限公司|集团公司|集团|事务所|研究院|研究中心|分公司|公司)"
+)
+
+
+def _duplicate_claim_unsubstantiated(item: dict[str, Any]) -> bool:
+    """结论断言「重复/雷同/完全相同」，但引用的原文中不存在实际重复的主体名称。
+
+    触发前提：detail/title 含重复类断言词，且能从 detail/evidence 中提取到
+    ≥2 个主体名称 token（提取不到说明无法证伪，不触发本防护，交人工/原判定）。
+    认定口径：全名归一化（去空白、忽略大小写）后完全一致才算重复；
+    简称/别名/分公司不与总公司视为重复（与 dec-09 口径一致，宁漏勿误）。
+    """
+    blob = " ".join(
+        [
+            str(item.get("detail") or ""),
+            str(item.get("title") or ""),
+            str(item.get("evidence") or ""),
+        ]
+    )
+    if not any(m in blob for m in _DUPLICATE_CLAIM_MARKS):
+        return False
+    # 在单个来源（evidence 或 detail）内提取主体并比对重复。
+    # 不做跨字段合并——detail 转述与 evidence 摘录同批名称属正常重述，
+    # 合并计数会把「同名重述」误判为「存在重复」而漏防。
+    for text in (str(item.get("evidence") or ""), str(item.get("detail") or "")):
+        # 先去空白再提取：名称内的空格/换行不改变主体同一性（「南京 ABC 公司」≡「南京ABC公司」）
+        compact = re.sub(r"\s+", "", text)
+        tokens = [t.lower() for t in _ENTITY_TOKEN_RE.findall(compact)]
+        if len(tokens) >= 2 and len(tokens) == len(set(tokens)):
+            return True  # 单一来源内 ≥2 个主体且互不相同 → 「重复」断言无实证
+    return False
+
+
+def _doc_names_from(docs: Any) -> list[str]:
+    """从送审文档列表提取真实文件名集合（用于反幻觉：校验结论引用的文件是否真实存在）。"""
+    names: list[str] = []
+    if not isinstance(docs, (list, tuple)):
+        return names
+    for d in docs:
+        if isinstance(d, dict):
+            n = str(d.get("filename") or d.get("file_name") or "").strip()
+            if n:
+                names.append(n)
+    return names
+
+
+def _unresolved_file_reference(item: dict[str, Any], doc_names: list[str]) -> bool:
+    """fail/warn 结论引用的文件全部解析不到真实送审文件 → 疑似臆造文件。
+
+    触发前提：involved_files 非空且其中没有任何一个能匹配到本次送审的真实文件名
+    （精确相等 / 互为子串）。命中说明模型把「未上传的文件」写进了结论，
+    属于无来源的幻觉引用（如把文档里没有的「XX公司投标文件」当依据）。
+    仅做精确的 involved_files 匹配，不做正文语义猜测，避免误伤合法泛称引用。
+    """
+    if str(item.get("status") or "").lower() not in ("fail", "warn"):
+        return False
+    raw = [str(x).strip() for x in (item.get("involved_files") or []) if str(x).strip()]
+    if not raw:
+        return False
+    names = set(doc_names or [])
+
+    def resolves(n: str) -> bool:
+        return any(d == n or d in n or n in d for d in names)
+
+    # 全部引用的文件都解析不到真实送审文件 → 疑似臆造
+    return all(not resolves(n) for n in raw)
+
+
+_ENTITY_SUFFIXES = (
+    "股份有限公司", "有限责任公司", "有限公司", "集团公司", "集团", "分公司",
+    "事务所", "研究院", "研究中心", "学校", "医院", "公司",
+)
+
+# 错别字类规则范围：其结论若把专有名词当错别字，按「无错别字」纠正。
+_TYPO_RULE_SCOPE = {"dec-17", "gen-typo"}
+
+
+def _typo_claim_is_entity_equivalence(item: dict[str, Any]) -> bool:
+    """错别字结论把「专有名词(公司/机构名)互为错别字」误判 → 应视为无错别字。
+
+    判定口径(稳健，不依赖脆弱的正则配对)：结论(detail/title)同时满足——
+      1) 声明了错别字类问题(错别字/错字/形近/音近)；
+      2) 出现等价断言词(应为/而非/改为/应写作/纠正为/修正为)；
+      3) 文本中能抽取到 ≥2 个不同的主体名称(以组织后缀结尾,如 有限公司/公司)。
+    三者同时成立 → 模型是在把「两个不同的主体名称」当成正误关系，专有名词不是
+    行文错别字，判定为无错别字(pass)。仅报单个主体名或仅普通行文错别字时不命中。
+    """
+    if str(item.get("status") or "").lower() not in ("fail", "warn"):
+        return False
+    blob = " ".join(
+        [
+            str(item.get("title") or ""),
+            str(item.get("detail") or ""),
+            str(item.get("evidence") or ""),
+        ]
+    )
+    if not any(k in blob for k in ("错别字", "错字", "形近", "音近")):
+        return False
+    if not any(kw in blob for kw in ("应为", "而非", "改为", "应写作", "纠正为", "修正为")):
+        return False
+    # 抽取主体名称(以组织后缀结尾的 span)，归一化(去空白、忽略大小写)后去重。
+    names = [re.sub(r"\s+", "", t).lower() for t in _ENTITY_TOKEN_RE.findall(blob)]
+    distinct = {n for n in names if n}
+    return len(distinct) >= 2
+
+
+def _explicitly_reports_no_violation(item: dict[str, Any]) -> bool:
+    """结语句明确写出「未发现/不存在 + 违规对象」等无违规结论。
+
+    与 _finding_text_contradicts_fail（相似度规则的窄口径兜底）互补：
+    本函数覆盖通用否定式结论（如「未发现否决投标情形」「不存在违法违规情形」），
+    命中且句内无转折/真实问题信号时，模型却把 status 填成 fail —— 直接纠正为 pass。
+    detail 的结语句与 title 任一命中即触发（title 常是一句话结论）。
+    """
+    for seg in (_conclusion_sentence({"detail": item.get("detail") or ""}),
+                str(item.get("title") or "")):
+        if not seg:
+            continue
+        if not _has_non_negated(seg, _NO_VIOLATION_MARKS):
+            continue
+        if not any(n in seg for n in _VIOLATION_NOUNS):
+            continue
+        # 先剥掉否定标记本身，再查失败信号（「不存在」含「存在」、「未发现」含「发现」的子串干扰）
+        stripped = seg
+        for m in _NO_VIOLATION_MARKS:
+            stripped = stripped.replace(m, "")
+        if not any(m in stripped for m in _FAIL_TAIL_MARKS):
+            return True
+    return False
+
+
 def _finding_text_contradicts_fail(item: dict[str, Any]) -> bool:
     """检测模型自相矛盾的判定：结构化字段标 fail，但结论文本明确倾向 pass/不构成违规。
 
@@ -1668,7 +2215,7 @@ def _apply_structured_rules(
                 defs = sections_store.for_file_type(sec_ids, d.get("file_type"))
                 if not defs:
                     continue
-                body, _names = sections_store.scope_text(d.get("text") or "", defs)
+                body, _names = _scoped_text(d, defs)
                 if body.strip():
                     parts.append(body)
             rule_text = "\n\n".join(parts) or ""
@@ -2660,7 +3207,9 @@ async def run_review(
                         }
                     # 错别字校验集过滤：命中用户「不采纳」过滤规则的自动跳过（去噪）
                     try:
-                        batch_findings = _normalize_findings(raw, batch)
+                        batch_findings = _normalize_findings(
+                            raw, batch, doc_names=_doc_names_from(batch_docs)
+                        )
                         batch_findings, _skipped = feedback_store.ingest_typo_findings(
                             batch_findings, task_id, user_id=user_id
                         )
@@ -2673,7 +3222,9 @@ async def run_review(
                             )
                     except Exception as exc:  # noqa: BLE001 - 过滤失败不应中断审核
                         logger.warning("错别字校验集过滤失败（已忽略）: %s", exc)
-                        batch_findings = _normalize_findings(raw, batch)
+                        batch_findings = _normalize_findings(
+                            raw, batch, doc_names=_doc_names_from(batch_docs)
+                        )
                     # 确定性归一化：对单条 finding 的离散字段做归一，消除大小写/空白漂移，
                     # 使同类结论在多次审核间稳定可比（如 status 统一小写、severity 归一）。
                     if det_mode:
@@ -2760,8 +3311,15 @@ async def run_review(
             for _idx, batch_findings, traces in batch_results:
                 kb_traces.extend(traces)
                 findings.extend(batch_findings)
-                for f in batch_findings:
-                    await emit({"type": "finding", "finding": f})
+
+            # 结构化原文定位：为每条结论附加 locations（file_id/页码/字符下标），
+            # 供前端与第三方应用直接加载原始文件并跳转到对应页与内容位置。
+            # 在 finding 事件下发前完成，保证 SSE 增量、任务落库与 done 事件
+            # 三条路径返回的结论均带定位信息（口径一致）。
+            _attach_locations(findings, docs)
+
+            for f in findings:
+                await emit({"type": "finding", "finding": f})
 
             # 每规则一条的最终聚合结果：把分段/多文档并行产生的 N 条并行结论合并去重为
             # 一条规则结果（20 规则 → 20 条），供前端「审核结果」按规则维度展示，

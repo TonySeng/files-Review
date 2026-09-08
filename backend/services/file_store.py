@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import doc_parser
+from . import doc_splitter
 from . import file_types
 from .. import config
 from .. import storage
@@ -115,6 +116,10 @@ async def save_and_parse(
         "page_count": 0,
         "used_ocr": False,
         "parse_error": None,
+        # 解析阶段产出的章节结构（doc_splitter，对齐 document-split 参考项目），
+        # 审核引擎按规则关联章节直接复用，避免逐批次全文重切
+        "sections": [],
+        "section_count": 0,
         "validation": {"ok": True, "level": "ok", "messages": []},
     }
 
@@ -129,6 +134,21 @@ async def save_and_parse(
     except Exception as exc:  # 解析失败不阻塞其他文件
         logger.warning("解析 %s 失败: %s", safe, exc)
         record["parse_error"] = str(exc)
+
+    # 章节拆分（解析阶段一次完成；失败仅降级为空，审核侧回退实时裁剪）
+    if record["text"].strip() and not record["parse_error"]:
+        try:
+            secs = doc_splitter.split_document(record["text"], ext)
+            record["sections"] = secs
+            record["section_count"] = sum(1 for s in secs if s.get("title"))
+            logger.info(
+                "章节拆分 %s：%d 段（%s）",
+                safe,
+                record["section_count"],
+                doc_splitter.stats(secs).get("by_source", {}),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("章节拆分 %s 失败（审核侧回退实时裁剪）: %s", safe, exc)
 
     # 内容规则校验：空文本/解析异常在状态中提示（不阻断上传，但审核前会再校验）
     if record["parse_error"]:
@@ -227,9 +247,9 @@ def delete(file_id: str) -> bool:
 
 
 def _public(record: dict[str, Any]) -> dict[str, Any]:
-    """不外传全文与本地路径。"""
+    """不外传全文、章节体与本地路径（section_count 保留供前端展示）。"""
     return {
         k: v
         for k, v in record.items()
-        if k not in ("text", "path")
+        if k not in ("text", "path", "sections")
     }

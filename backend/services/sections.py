@@ -255,19 +255,9 @@ def _score(heading_key: str, kw_key: str) -> tuple[int, int] | None:
     return None
 
 
-def match_sections(
-    text: str, section_defs: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """在文档正文中匹配给定章节定义。
-
-    返回命中列表（按文档中出现顺序）：
-      [{"section_id", "name", "headings": [命中的原始标题...], "body": 合并后的正文}]
-    一个标题最多归属一个章节（精确优先、同分取最长关键词）。
-    """
-    if not section_defs:
-        return []
-    # 预计算每个章节的关键词（规范名 + 同义词），归一化去重去空
-    kw_index: list[tuple[str, str, str]] = []  # (section_id, name, kw_key)
+def _build_kw_index(section_defs: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+    """预计算章节关键词索引：[(section_id, 规范名, 归一化关键词)]，去重去空。"""
+    kw_index: list[tuple[str, str, str]] = []
     for sec in section_defs:
         sid = str(sec.get("id") or "")
         name = str(sec.get("name") or "")
@@ -278,11 +268,21 @@ def match_sections(
             if kk and kk not in seen:
                 seen.add(kk)
                 kw_index.append((sid, name, kk))
+    return kw_index
 
+
+def _match_entries_into_buckets(
+    entries: list[tuple[str, str]], kw_index: list[tuple[str, str, str]]
+) -> list[dict[str, Any]]:
+    """把 [(标题, 章节体)] 序列按关键词索引匹配并合并进章节桶。
+
+    一个标题最多归属一个章节（精确优先、同分取最长关键词）；
+    同一章节多处命中时正文合并、按文档出现顺序返回。
+    """
     buckets: dict[str, dict[str, Any]] = {}
     order: list[str] = []
-    for sec in split_sections(text):
-        hk = normalize_key(sec["title"])
+    for title, body in entries:
+        hk = normalize_key(title)
         if not hk:
             continue
         best: tuple[int, int, str, str] | None = None  # (score, kwlen, sid, name)
@@ -304,11 +304,50 @@ def match_sections(
                 "body": "",
             }
             order.append(sid)
-        buckets[sid]["headings"].append(sec["title"] or sec["raw"])
+        buckets[sid]["headings"].append(title)
         buckets[sid]["body"] = (
-            buckets[sid]["body"] + "\n\n" + sec["body"] if buckets[sid]["body"] else sec["body"]
+            buckets[sid]["body"] + "\n\n" + body if buckets[sid]["body"] else body
         )
     return [buckets[sid] for sid in order]
+
+
+def match_sections(
+    text: str, section_defs: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """在文档正文中匹配给定章节定义（实时切分路径，兼容旧文件）。
+
+    返回命中列表（按文档中出现顺序）：
+      [{"section_id", "name", "headings": [命中的原始标题...], "body": 合并后的正文}]
+    """
+    if not section_defs:
+        return []
+    kw_index = _build_kw_index(section_defs)
+    entries = [(s["title"] or s["raw"], s["body"]) for s in split_sections(text)]
+    return _match_entries_into_buckets(entries, kw_index)
+
+
+def scope_from_prepared(
+    prepared: list[dict[str, Any]], section_defs: list[dict[str, Any]]
+) -> tuple[str, list[str]]:
+    """按「解析阶段预拆分的章节结构」匹配章节定义（审核阶段直接复用，不再全文重切）。
+
+    prepared 为 doc_splitter.split_document 的产物（file record 的 sections 字段），
+    匹配语义与 scope_text 完全一致（同一套归一化与打分），未命中返回 ("", [])。
+    """
+    if not prepared or not section_defs:
+        return "", []
+    kw_index = _build_kw_index(section_defs)
+    entries = [
+        (str(s.get("title") or ""), str(s.get("body") or ""))
+        for s in prepared
+        if isinstance(s, dict)
+    ]
+    hits = _match_entries_into_buckets(entries, kw_index)
+    if not hits:
+        return "", []
+    body = "\n\n".join(h["body"] for h in hits)
+    names = [h["name"] for h in hits]
+    return body, names
 
 
 def scope_text(text: str, section_defs: list[dict[str, Any]]) -> tuple[str, list[str]]:

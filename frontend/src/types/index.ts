@@ -221,6 +221,34 @@ export interface TypoInfo {
   context?: string
 }
 
+/** 结构化原文定位：一条结论在某份源文件中的位置（后端 Finding.locations） */
+/** PDF 页面锚点矩形（PDF 坐标系：原点左下、y 向上，单位 pt，与 PDF.js 兼容） */
+export interface LocRect {
+  page: number
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+}
+
+export interface FindingLocation {
+  file_id: string | null
+  filename: string
+  ext?: string | null
+  /** 锚点所在页码；无页标记文档（docx/txt/xlsx）为单页全文（page=1） */
+  page: number | null
+  page_label?: string | null
+  page_count?: number | null
+  /** 锚点在提取全文中的绝对字符下标，与 /files/{id}/preview 的 start/end 同口径 */
+  char_start: number | null
+  char_end: number | null
+  snippet?: string | null
+  matched: boolean
+  match_type?: 'exact' | 'normalized' | 'fuzzy' | null
+  /** PDF 专属：原始页面上锚点的精确矩形坐标，供前端绘制高亮框 */
+  rects?: LocRect[] | null
+}
+
 export interface Finding {
   rule_id: string
   rule_name: string
@@ -234,6 +262,7 @@ export interface Finding {
   suggestion: string
   legal_basis: string
   involved_files: string[]
+  locations?: FindingLocation[]
   confidence: number
   typo?: TypoInfo | null
 }
@@ -653,6 +682,7 @@ export interface RuleFileResult {
     location: string
     suggestion: string
     confidence?: number | null
+    locations?: FindingLocation[]
   }[]
 }
 

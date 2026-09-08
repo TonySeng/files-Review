@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -79,9 +80,41 @@ async def _parse_pdf(path: Path) -> dict[str, Any]:
     return {"text": "\n\n".join(numbered), "page_count": page_count, "used_ocr": used_ocr}
 
 
+def _docx_heading_level(p, style_name: str) -> bool:
+    """判断 docx 段落是否标题（对齐 document-split 参考项目的识别策略）。
+
+    优先级：大纲级别 outline_level（Word 内置，最可靠）> 样式名精确匹配
+    （Heading N / 标题 N / 中文数字 / Title / Subtitle / 小标题）> 旧口径的
+    宽泛包含匹配（兜底，保持向后兼容）。
+    """
+    # 1) 大纲级别：0=正文，1-9=层级
+    try:
+        outline = p.paragraph_format.outline_level
+        if outline is not None and int(outline) > 0:
+            return True
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+    sn = (style_name or "").strip()
+    if not sn:
+        return False
+    # 2) 样式名精确匹配（阿拉伯/中文数字、常见标题样式）
+    if re.match(r"^(?:[Hh]eading|标题)\s*\d+$", sn):
+        return True
+    if re.match(r"^(?:[Hh]eading|标题)\s*[一二三四五六七八九十]+$", sn):
+        return True
+    if sn.lower() in ("title", "subtitle", "subheading", "toc heading"):
+        return True
+    if "小标题" in sn:
+        return True
+    # 3) 兜底：旧口径宽泛包含（部分文档用自定义样式名如「标题-1」）
+    return "Heading" in sn or "标题" in sn
+
+
 def _parse_docx(path: Path) -> dict[str, Any]:
     try:
         import docx
+        from docx.oxml.ns import qn
     except ImportError as exc:
         raise ParseError("缺少 python-docx 依赖，无法解析 Word") from exc
     if path.suffix.lower() == ".doc":
@@ -90,26 +123,41 @@ def _parse_docx(path: Path) -> dict[str, Any]:
     document = docx.Document(str(path))
     parts = []
     chapter_idx = 0
-    for p in document.paragraphs:
-        text = p.text.strip()
-        if not text:
-            continue
-        # 对标题样式段落插入章节标记，供 text_locator 推断「第N章」位置
-        style_name = (p.style.name or "") if p.style else ""
-        if "Heading" in style_name or "标题" in style_name:
-            chapter_idx += 1
-            parts.append(f"[第{chapter_idx}章: {text}]\n")
-        else:
-            parts.append(text)
-    # 表格是投标文件的关键载体（报价表、资质表），逐行提取
-    for ti, table in enumerate(document.tables):
-        rows = []
-        for row in table.rows:
-            cells = [c.text.strip().replace("\n", " ") for c in row.cells]
-            if any(cells):
-                rows.append(" | ".join(cells))
-        if rows:
-            parts.append(f"[表格{ti + 1}]\n" + "\n".join(rows))
+    table_idx = 0
+
+    # 按文档流顺序遍历 body 子元素（段落+表格交错），表格落在所属章节内——
+    # 对齐参考项目 parse_docx；旧实现把全部表格追加文末，导致报价表等脱离章节
+    para_objs = {p._element: p for p in document.paragraphs}
+    table_objs = {t._element: t for t in document.tables}
+
+    for child in document.element.body.iterchildren():
+        tag = child.tag
+        if tag == qn("w:p"):
+            p = para_objs.get(child)
+            if p is None:
+                continue
+            text = p.text.strip()
+            if not text:
+                continue
+            style_name = (p.style.name or "") if p.style else ""
+            if _docx_heading_level(p, style_name):
+                chapter_idx += 1
+                # 对标题样式段落插入章节标记，供 text_locator 推断「第N章」位置
+                parts.append(f"[第{chapter_idx}章: {text}]\n")
+            else:
+                parts.append(text)
+        elif tag == qn("w:tbl"):
+            t = table_objs.get(child)
+            if t is None:
+                continue
+            table_idx += 1
+            rows = []
+            for row in t.rows:
+                cells = [c.text.strip().replace("\n", " ") for c in row.cells]
+                if any(cells):
+                    rows.append(" | ".join(cells))
+            if rows:
+                parts.append(f"[表格{table_idx}]\n" + "\n".join(rows))
     return {"text": "\n\n".join(parts), "page_count": 0, "used_ocr": False}
 
 

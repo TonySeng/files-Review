@@ -101,6 +101,16 @@ async def locate_snippet(
     if not snippet:
         raise HTTPException(status_code=400, detail="待定位的片段不能为空")
 
+    # 过短锚点防护：evidence 只填了「无」这类占位词时，单字/短串会在全文
+    # 随机命中无关位置（如正文里的「无」字），直接拒绝检索而不是给错误定位。
+    cand_list = [str(c).strip() for c in (req.candidates or []) if str(c).strip()]
+    if len(snippet) < 4 and not any(len(c) >= 4 for c in cand_list):
+        return {
+            "snippet": snippet,
+            "matches": [],
+            "message": "定位锚点过短（少于 4 字），已拒绝检索以避免错误定位",
+        }
+
     if req.file_ids:
         try:
             docs = file_store.get_many(req.file_ids)
@@ -217,6 +227,45 @@ async def get_text(file_id: str, limit: int = 20000, caller: dict = Depends(deps
         "char_count": len(text),
         "truncated": len(text) > limit,
         "text": text[:limit],
+    }
+
+
+@router.get("/{file_id}/sections", summary="获取解析阶段产出的章节结构")
+async def get_sections(file_id: str, caller: dict = Depends(deps.get_caller)):
+    """返回解析阶段按 document-split 方式拆分的章节结构（不返回章节全文）。
+
+    每个章节含：title（可读章节名，""=标题前的前置内容）、raw（原始标题行）、
+    level（标题层级 1-3）、page（所在页码）、char_start/char_end（原文偏移，
+    可直接用于原文定位/预览高亮）、char_len（章节体长度）、preview（前 120 字预览）、
+    source（style=Word 样式标题 / worksheet=Excel 工作表 / regex=正则识别 /
+    preamble=前置内容）。审核引擎按规则关联章节直接复用该结构做精确送审。
+    """
+    record = file_store.get(file_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    sections = record.get("sections") or []
+    out = []
+    for s in sections:
+        body = str(s.get("body") or "")
+        out.append(
+            {
+                "title": s.get("title") or "",
+                "raw": s.get("raw") or "",
+                "level": s.get("level", 0),
+                "page": s.get("page", 1),
+                "char_start": s.get("char_start", 0),
+                "char_end": s.get("char_end", 0),
+                "char_len": len(body),
+                "preview": body[:120],
+                "source": s.get("source") or "",
+            }
+        )
+    return {
+        "file_id": file_id,
+        "filename": record.get("filename"),
+        "ext": record.get("ext"),
+        "section_count": record.get("section_count", 0),
+        "sections": out,
     }
 
 

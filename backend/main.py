@@ -20,6 +20,7 @@ from .routers import (
     feedback,
     file_types,
     rulegroups,
+    sections,
     legalrules,
     prompts,
     reviewdata,
@@ -109,6 +110,7 @@ app.include_router(export.router)
 app.include_router(feedback.router)
 app.include_router(file_types.router)
 app.include_router(rulegroups.router)
+app.include_router(sections.router)
 app.include_router(legalrules.router)
 app.include_router(prompts.router)
 app.include_router(reviewdata.router)
@@ -118,6 +120,37 @@ app.include_router(auth.router)
 app.include_router(auth.admin)
 app.include_router(auth.user_keys)
 app.include_router(admin.router)
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI 文档增强：追加枚举速查表 + 各接口真实业务示例（见 openapi_enrich.py）。
+# 零侵入：仅在 schema 生成后做后处理，不改变任何路由行为。
+# ---------------------------------------------------------------------------
+from .openapi_enrich import enrich_openapi  # noqa: E402
+
+try:
+    from fastapi.openapi.utils import get_openapi  # noqa: E402
+except Exception:  # noqa: BLE001
+    get_openapi = None  # type: ignore[assignment]
+
+
+def custom_openapi() -> dict:
+    if app.openapi_schema:
+        return app.openapi_schema
+    if get_openapi is None:
+        return {}
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema = enrich_openapi(schema)
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi  # type: ignore[assignment]
 
 
 @app.middleware("http")

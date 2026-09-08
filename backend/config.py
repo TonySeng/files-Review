@@ -135,6 +135,14 @@ DEFAULTS: dict[str, Any] = {
     # Fix B：单逻辑 LLM 调用总墙钟硬上限（秒）。实际生效值 = min(req_timeout*3, 本值)，
     # 防止"连接挂起 + 多次重试"把一次调用拖到十几分钟拖垮整任务。
     "llm_call_hard_ceil": 1800,  # 单逻辑调用墙钟绝对上界；实际生效 = min(req_timeout×max_attempts, 本值)。提到 1800 以覆盖一致性比对(600×3)的完整重试预算，避免"1 次尝试后即被硬上限剥夺重试"
+    # 上下文超长降级（Fix：上线后频繁出现大模型上下文超长 400）。
+    # llm_max_input_tokens：发前 token 预算上限（保守值，为主体 128k 窗口留足输出/系统/安全余量）。
+    # 拼好的 messages 估算 token 超此值即主动降级（丢弃 KB 依据→截断送审正文），不直接发必败请求；
+    # 若真实返回 400 上下文超长，由 llm_client.LLMContextOverflow 触发同款多级降级。
+    # 该值是「输入预算」，不含模型输出与系统提示；设为 60000 远低于窗口上限以规避边界抖动。
+    "llm_max_input_tokens": 60000,
+    # 上下文超长时的最大多级降级次数（0=关闭降级，直接以 LLMContextOverflow 失败；默认 3：丢 KB→截 50%→截 20%）
+    "llm_context_overflow_max_degrade": 3,
     # ---- 确定性执行（可重复审核结果一致）----
     # 开关：开启后审核引擎固定规则执行顺序、temperature=0、关闭并发竞态（串行执行），
     # 不把当前系统时间作为任何判断依据，并对 LLM 输出做结构化约束与确定性归一化。

@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react'
-import { Button, Empty, Input, Select, Space, Tag, Tooltip, Typography } from 'antd'
+import { useMemo } from 'react'
+import { Button, Empty, Input, Select, Space, Tooltip, Typography } from 'antd'
 import { DeleteOutlined, PlusOutlined } from '@ant-design/icons'
 import type { ConsistencyElement } from '../types'
+import SynonymTagsInput from './SynonymTagsInput'
 
 interface Props {
   value: ConsistencyElement[]
@@ -16,8 +17,6 @@ interface Props {
  * 模型据此逐文件提取取值并统一归并到规范名下比对，因此规范名即跨文件对齐的 key。
  */
 export default function ConsistencyElementsEditor({ value, library, onChange }: Props) {
-  const [aliasDraft, setAliasDraft] = useState<Record<number, string>>({})
-
   const groupedOptions = useMemo(() => {
     const map = new Map<string, ConsistencyElement[]>()
     for (const e of library) {
@@ -61,27 +60,6 @@ export default function ConsistencyElementsEditor({ value, library, onChange }: 
 
   const patch = (idx: number, part: Partial<ConsistencyElement>) => {
     commit(value.map((e, i) => (i === idx ? { ...e, ...part } : e)))
-  }
-
-  const addAlias = (idx: number) => {
-    const raw = (aliasDraft[idx] || '').trim()
-    if (!raw) return
-    const current = value[idx]
-    const parts = raw
-      .split(/[,，、\s]+/)
-      .map((s) => s.trim())
-      .filter(Boolean)
-    const merged = [...(current.synonyms || [])]
-    for (const p of parts) {
-      if (!merged.includes(p)) merged.push(p)
-    }
-    patch(idx, { synonyms: merged })
-    setAliasDraft((d) => ({ ...d, [idx]: '' }))
-  }
-
-  const removeAlias = (idx: number, alias: string) => {
-    const current = value[idx]
-    patch(idx, { synonyms: (current.synonyms || []).filter((s) => s !== alias) })
   }
 
   return (
@@ -142,30 +120,11 @@ export default function ConsistencyElementsEditor({ value, library, onChange }: 
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                     同义写法（用于定位该要素的不同表述）
                   </Typography.Text>
-                  <div style={{ marginTop: 4 }}>
-                    {(el.synonyms || []).map((s) => (
-                      <Tag
-                        key={s}
-                        closable
-                        onClose={() => removeAlias(idx, s)}
-                        style={{ marginBottom: 4 }}
-                      >
-                        {s}
-                      </Tag>
-                    ))}
-                    {!(el.synonyms || []).length && (
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        未配置，将只按规范名查找
-                      </Typography.Text>
-                    )}
-                  </div>
-                  <Input
-                    size="small"
-                    value={aliasDraft[idx] || ''}
-                    placeholder="输入别名后回车添加，多个可用逗号分隔"
-                    onChange={(e) => setAliasDraft((d) => ({ ...d, [idx]: e.target.value }))}
-                    onPressEnter={() => addAlias(idx)}
-                    style={{ marginTop: 4 }}
+                  {/* 与章节库共用同一套同义词编辑交互 */}
+                  <SynonymTagsInput
+                    value={el.synonyms || []}
+                    onChange={(next) => patch(idx, { synonyms: next })}
+                    emptyHint="未配置，将只按规范名查找"
                   />
                 </div>
 

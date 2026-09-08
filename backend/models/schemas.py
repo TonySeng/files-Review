@@ -27,6 +27,9 @@ class Rule(BaseModel):
     builtin: bool = False
     # 关联文档类型：仅对这些文件类型的文件执行本规则审核；空列表=适用于全部文件
     doc_types: list[str] = Field(default_factory=list)
+    # 关联章节：仅对命中章节的正文执行本规则审核；空列表=不按章节裁剪（全量审核）
+    # 章节以文件类型为维度（sections.file_type_id），审核时按每个文件自身的类型取交集
+    section_ids: list[str] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
 
@@ -308,6 +311,9 @@ class ConfigUpdate(BaseModel):
     max_chars_per_doc: int | None = None
     concurrency: int | None = None
     llm_max_concurrent: int | None = None  # 全局并发闸：同时打到 LLM 提供方的在途请求上限
+    # 上下文超长降级：不加入白名单会被 PATCH 静默丢弃，导致预算无法按模型窗口在线调整
+    llm_max_input_tokens: int | None = None  # 发前 token 预算上限：估算超此值即触发多级降级
+    llm_context_overflow_max_degrade: int | None = None  # 上下文超长最大降级次数（0=关闭降级）
     rules_per_batch: int | None = None  # 每批送审规则数（方案C：6 → 10）
     findings_cache_enabled: bool | None = None  # 方案C：相同输入批次复用历史结论、跳过 LLM 调用的全局开关
     consistency_cache_enabled: bool | None = None  # 一致性切片摘要缓存开关（提效①）

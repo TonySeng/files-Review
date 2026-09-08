@@ -20,7 +20,7 @@ cd "$(dirname "$0")"
 ROOT="$(pwd)"
 
 PKG="bidding-review-deploy"
-FINAL="bidding-review-arm64-final12"
+FINAL="bidding-review-arm64-final17"
 
 echo "=================================================="
 echo " 重新生成部署包: $FINAL"
@@ -31,7 +31,8 @@ if ! command -v node >/dev/null 2>&1; then
   MNG="/c/Users/51575/.workbuddy/binaries/node/versions/22.22.2-2"
   if [ -d "$MNG" ]; then export PATH="$MNG:$PATH"; fi
 fi
-echo ">> node: $(command -v node >/dev/null && node -v || echo 'NOT FOUND')"
+NODE_BIN="$(command -v node || true)"
+echo ">> node: $([ -n "$NODE_BIN" ] && "$NODE_BIN" -v || echo 'NOT FOUND')"
 
 # ---------- 1) 清掉 deploy/backend 里待刷新的源码，保留 Dockerfile/requirements ----------
 # 注意：本机 safe-delete 钩子拦截批量 rm -rf（>50 项），统一改为 mv 到 /tmp
@@ -40,14 +41,14 @@ echo ">> 刷新后端源码（保留 arm64 Dockerfile + requirements）..."
 for d in models routers services; do
   if [ -d "$PKG/backend/$d" ]; then mv "$PKG/backend/$d" "/tmp/old_pkg_backend_$d.$STAMP"; fi
 done
-for f in config.py main.py __init__.py __main__.py; do
+for f in config.py main.py __init__.py __main__.py openapi_enrich.py; do
   if [ -f "$PKG/backend/$f" ]; then mv "$PKG/backend/$f" "/tmp/old_pkg_backend_$f.$STAMP"; fi
 done
 
 # tar 管道：从当前 backend/ 复制指定目录与文件，排除缓存
 ( cd backend && tar cf - --exclude='__pycache__' --exclude='*.pyc' \
     models routers services storage storage_config.example.json \
-    config.py main.py __init__.py __main__.py \
+    config.py main.py __init__.py __main__.py openapi_enrich.py \
   | ( cd "../$PKG/backend" && tar xf - ) )
 echo ">> 后端源码同步完成"
 
@@ -64,11 +65,25 @@ else
   echo ">> reportlab 已在 deploy requirements 中"
 fi
 
+# ---------- 2.5) 附带 structured 迁移脚本 ----------
+# 131 的 app.db 不随包同步，自定义规则集里的结构化条件必须上机执行迁移才会更新。
+if [ -f migrate_structured.py ]; then
+  cp migrate_structured.py "$PKG/migrate_structured.py"
+  echo ">> 已附带 migrate_structured.py（部署后需 docker cp 进后端容器执行）"
+fi
+
 # ---------- 3) 重建前端 dist 并拷入 deploy ----------
 echo ">> 构建前端 dist（npm run build）..."
 # 注意：vite emptyOutDir 会 rm -rf frontend/dist，被 safe-delete 钩子拦截，先移走
 mv frontend/dist "/tmp/old_front_dist_$(date +%s)" 2>/dev/null || true
-( cd frontend && npm run build )
+# 沙箱下 npm 清理 dist 可能被 safe-delete 钩子拦截；npm 失败则回退直调 vite（已验证可靠）
+( cd frontend && \
+  if command -v npm >/dev/null 2>&1 && npm run build; then
+    echo ">> 构建方式: npm run build"
+  else
+    echo ">> npm run build 失败，回退直调 vite"
+    "$NODE_BIN" node_modules/vite/bin/vite.js build || exit 1
+  fi )
 # 注意：本机 safe-delete 钩子会拦截 rm -rf dist，改为移到 /tmp
 mv "$PKG/frontend/dist" "/tmp/old_deploy_dist_$(date +%s)" 2>/dev/null || true
 cp -r frontend/dist "$PKG/frontend/dist"

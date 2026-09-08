@@ -29,11 +29,13 @@ import {
   GroupOutlined,
   BookOutlined,
   RobotOutlined,
+  BarsOutlined,
 } from '@ant-design/icons'
 import BackToTop from './components/BackToTop'
 import RuleManagementPage from './pages/RuleManagementPage'
 import FileTypeConfigPage from './pages/FileTypeConfigPage'
 import RuleGroupConfigPage from './pages/RuleGroupConfigPage'
+import SectionManagementPage from './pages/SectionManagementPage'
 import HistoricalDataPage from './pages/HistoricalDataPage'
 import HomePage from './pages/HomePage'
 import TaskWizard from './pages/TaskWizard'
@@ -110,7 +112,17 @@ export default function App() {
     'checking',
   )
   const [ruleView, setRuleView] = useState<
-    'home' | 'rules' | 'filetypes' | 'rulegroups' | 'reviewdata' | 'feedback' | 'usermgmt' | 'audit' | 'prompts' | 'legalmgmt'
+    | 'home'
+    | 'rules'
+    | 'filetypes'
+    | 'rulegroups'
+    | 'sections'
+    | 'reviewdata'
+    | 'feedback'
+    | 'usermgmt'
+    | 'audit'
+    | 'prompts'
+    | 'legalmgmt'
   >('home')
   const [page, setPage] = useState<Page>('home')
 
@@ -192,6 +204,7 @@ export default function App() {
         children: [
           { key: 'filetypes', icon: <TagsOutlined />, label: '文件类型配置' },
           { key: 'rulegroups', icon: <GroupOutlined />, label: '审核规则组' },
+          { key: 'sections', icon: <BarsOutlined />, label: '章节库配置' },
         ],
       },
     ]
@@ -576,6 +589,8 @@ export default function App() {
             void api.listRuleGroups().then((r) => setRuleGroups(r.rule_groups))
           }
         />
+      ) : ruleView === 'sections' ? (
+        <SectionManagementPage onBack={() => setRuleView('home')} />
       ) : ruleView === 'reviewdata' ? (
         <HistoricalDataPage onBack={() => setRuleView('home')} isAdmin={isAdmin} />
       ) : ruleView === 'feedback' ? (

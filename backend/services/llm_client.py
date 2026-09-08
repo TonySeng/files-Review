@@ -21,6 +21,16 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMContextOverflow(LLMError):
+    """大模型返回 400 且提示上下文/输入超长（maximum context length / prompt is too long 等）。
+
+    属于「结构性超长」而非瞬时限流/过载，不能用简单的退避重试消化——必须由调用方做
+    「丢弃 KB 依据 / 截断送审正文 / 强制分片摘要」等降级处理后再试，否则整批静默失败。
+    继承自 LLMError，故既有的 ``except llm_client.LLMError`` 仍能兜底捕获（退化为告警跳过），
+    而需要主动降级的调用方可优先 ``except llm_client.LLMContextOverflow`` 做精准处理。
+    """
+
+
 # 全局并发闸：限制同时打到 LLM 提供方的在途请求数，避免「批次并发」放大触发限流(429/503)雪崩。
 # 与审核引擎的批次并发解耦——批次可多路在飞计算 prompt，但落库到提供方的请求受此闸约束。
 _LLM_SEM: asyncio.Semaphore | None = None
@@ -46,6 +56,66 @@ def _is_transient_llm_error(exc: Exception) -> bool:
     keys = ("429", "503", "System is too busy", "ReadTimeout", "ConnectError",
             "ConnectTimeout", "timed out", "RemoteProtocolError", "too many request")
     return any(k.lower() in s.lower() for k in keys)
+
+
+# 上下文超长关键词：命中即判定为「输入超模型上下文窗口」（而非参数/鉴权错误）。
+# 覆盖 OpenAI/vLLM/SiliconFlow/千问 等常见英文与中文报错文案，做大小写无关子串匹配。
+_CONTEXT_OVERFLOW_KEYS = (
+    "maximum context length",
+    "context length",
+    "prompt is too long",
+    "prompt exceeds",
+    "tokens exceed",
+    "exceeds the maximum",
+    "context window",
+    "too many tokens",
+    "input token",
+    "sequence length",
+    "token limit",
+    # OpenAI 官方错误码与 vLLM 常见文案（务必覆盖，否则真实超长会被漏判为普通 400）
+    "context_length_exceeded",
+    "longer than the maximum",
+    "maximum model length",
+    # 中文关键词需足够具体：裸「超出」会误判「参数超出范围」等非超长 400，故限定为长度/上下文相关表述
+    "超过最大",
+    "上下文长度",
+    "长度超出",
+    "超出上下文",
+    "超长",
+)
+
+
+def _is_context_overflow(body: str) -> bool:
+    """从错误响应体识别「上下文/输入超长」语义（400 类）。"""
+    b = (body or "").lower()
+    return any(k in b for k in _CONTEXT_OVERFLOW_KEYS)
+
+
+def estimate_tokens(text: str) -> int:
+    """近似 token 计数（不依赖 tiktoken，避免引入重依赖）。
+
+    中文/日文/韩文等 CJK 统一表意文字按 ~1.6 token 计，其余字符（英文/数字/标点/空白）
+    按 ~0.3 token 计。对以中文招标/投标文件为主的场景，用于「发前 token 预算」判断足够准确，
+    且偏差方向偏保守（多估），不会漏判超长。复杂 CJK 扩展区字符也按 CJK 计，避免低估。
+    """
+    if not text:
+        return 0
+    cjk = 0
+    other = 0
+    for ch in text:
+        o = ord(ch)
+        if (
+            0x3000 <= o <= 0x30FF          # CJK 标点 + 日文假名
+            or 0x3400 <= o <= 0x4DBF       # 扩展 A
+            or 0x4E00 <= o <= 0x9FFF       # 基本汉字
+            or 0xF900 <= o <= 0xFAFF       # 兼容汉字
+            or 0xAC00 <= o <= 0xD7AF       # 韩文音节
+            or 0x20000 <= o <= 0x2FFFF     # 扩展 B+（生僻字）
+        ):
+            cjk += 1
+        else:
+            other += 1
+    return int(cjk * 1.6 + other * 0.3) + 1
 
 
 def _base_url() -> str:
@@ -247,6 +317,9 @@ async def chat(
                     )
                 continue
             # 其余 4xx（鉴权/参数/模型不存在等）：不可重试，直接抛出
+            # 但若属「上下文超长」语义，抛出可降级的 LLMContextOverflow，交由引擎做多级降级重试
+            if _status == 400 and _is_context_overflow(body):
+                raise LLMContextOverflow(f"大模型返回 400 上下文超长: {body}")
             raise LLMError(f"大模型返回 {_status}: {body}")
         if stream:
             # 流式成功路径：拼好的增量文本直接作为 content 返回（挖掘场景无需 tool_calls）
@@ -336,6 +409,8 @@ async def chat_stream(
         ) as resp:
             if resp.status_code >= 400:
                 body = (await resp.aread()).decode("utf-8", "replace")
+                if resp.status_code == 400 and _is_context_overflow(body):
+                    raise LLMContextOverflow(f"大模型返回 400 上下文超长: {body[:400]}")
                 raise LLMError(f"大模型返回 {resp.status_code}: {body[:400]}")
             async for line in resp.aiter_lines():
                 if not line or not line.startswith("data:"):

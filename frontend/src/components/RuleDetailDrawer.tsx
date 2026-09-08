@@ -10,6 +10,8 @@ interface Props {
   onClose: () => void
   onEdit?: (rule: Rule) => void
   onClone?: () => void
+  /** 章节 id→name 映射，用于展示规则关联章节 */
+  sectionMap?: Record<string, string>
 }
 
 export default function RuleDetailDrawer({
@@ -19,6 +21,7 @@ export default function RuleDetailDrawer({
   onClose,
   onEdit,
   onClone,
+  sectionMap = {},
 }: Props) {
   return (
     <Drawer
@@ -59,6 +62,39 @@ export default function RuleDetailDrawer({
               {rule.description || (
                 <Typography.Text type="secondary">（无说明）</Typography.Text>
               )}
+            </div>
+          </div>
+
+          <div>
+            <div className="rd-label">审核范围</div>
+            <div className="rule-detail-block">
+              <Space size={6} wrap>
+                {rule.doc_types?.length ? (
+                  <Typography.Text>
+                    仅对「{rule.doc_types.join('、')}」类型的文件执行
+                  </Typography.Text>
+                ) : (
+                  <Typography.Text type="secondary">不限定文件类型</Typography.Text>
+                )}
+              </Space>
+              <div style={{ marginTop: 6 }}>
+                {rule.section_ids?.length ? (
+                  <Space size={4} wrap>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      仅审核章节：
+                    </Typography.Text>
+                    {rule.section_ids.map((sid) => (
+                      <Tag key={sid} color="purple">
+                        {sectionMap[sid] || sid}
+                      </Tag>
+                    ))}
+                  </Space>
+                ) : (
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    不按章节裁剪（审核文档全文）
+                  </Typography.Text>
+                )}
+              </div>
             </div>
           </div>
 

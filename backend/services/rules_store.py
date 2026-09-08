@@ -242,13 +242,12 @@ BID_RULES: list[dict[str, Any]] = [
             "是否提供无重大违法记录声明",
             "是否存在法律法规规定的禁止参加投标情形",
         ],
-        "structured": {
-            "forbid_keywords": [
-                "失信被执行人", "重大税收违法", "政府采购严重违法失信",
-                "列入失信", "限制消费", "禁止参加投标", "不良行为记录"
-            ],
-            "require_elements": ["无重大违法记录声明", "信用查询记录"]
-        },
+        # 注意：本规则【不要】配 structured 的 forbid_keywords / require_elements。
+        # 二者都是「字面子串命中即锁定 fail」，而这类禁止性/资格性表述在合规文件中
+        # 恰恰以否定式出现（如「投标人不得被列入失信被执行人名单」「不存在不良行为记录」），
+        # 字面命中会 100% 误判为不合规，且确定性结论 LLM 无法推翻（confidence=1.0）。
+        # 同样的道理适用于「无重大违法记录声明」等要素——「无行贿犯罪记录承诺函」等等效
+        # 表述拿不到字面匹配就会被判缺失。此类规则交给 LLM 做语义判断，不结构化。
     },
     {
         "id": "qual-consortium", "name": "联合体投标合规性",
@@ -284,10 +283,11 @@ BID_RULES: list[dict[str, Any]] = [
             "是否存在选择性报价或缺项漏项",
             "税率与含税口径是否符合要求",
         ],
-        "structured": {
-            "require_elements": ["开标一览表", "投标报价", "投标总价", "税率"],
-            "forbid_keywords": ["选择性报价", "缺项漏项", "低于成本价"]
-        },
+        # 同 qual-credit：本规则【不要】配 structured。
+        # 「选择性报价」「缺项漏项」「低于成本价」在合规文件中常以「不存在选择性报价」
+        # 这类否定式声明出现，字面命中即 fail 属纯误判；「税率」等要素也并非所有报价表
+        # 都会出现，require_elements 缺失即 fail 同样会误杀。算术校核本身需要模型读表计算，
+        # 结构化条件表达不了，故整条规则回落 LLM。
     },
     {
         "id": "biz-validity", "name": "投标有效期与工期承诺",
@@ -812,6 +812,11 @@ def _normalize_rule(raw: dict[str, Any]) -> dict[str, Any]:
         "builtin": bool(raw.get("builtin")),
         # 关联文档类型：仅对匹配文件类型的文件执行本规则审核；缺省/空=适用于全部文件
         "doc_types": [str(x).strip() for x in (raw.get("doc_types") or []) if str(x).strip()],
+        # 关联章节：仅对命中章节的正文执行本规则审核；缺省/空=不裁剪（沿用全量审核）。
+        # 章节以文件类型为维度，审核时按文档自身 file_type 与 section_ids 取交集。
+        "section_ids": [
+            str(x).strip() for x in (raw.get("section_ids") or []) if str(x).strip()
+        ],
         # 结构化可执行条件（需求 1.2）：可计算条件，由确定性规则引擎直接判定，
         # LLM 仅作辅助证据摘要，不决定 fail/pass。
         "structured": _normalize_structured(raw.get("structured")),
@@ -884,6 +889,20 @@ def _merge_elements(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(merged.values())
 
 
+def _opt_float(val: Any) -> float | None:
+    """宽松转 float：None/空串/非法值一律返回 None，不抛异常、不静默当 0。
+
+    用于「阈值类」可选字段——若沿用 float(x or 0) 的写法，会把「未配置」与
+    「阈值就是 0」混为一谈，导致相对阈值（max_ratio）被 0 顶掉。
+    """
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_structured(raw: Any) -> dict[str, Any] | None:
     """校验并归一化 structured 可执行条件字段。
 
@@ -892,7 +911,9 @@ def _normalize_structured(raw: Any) -> dict[str, Any] | None:
     - require_elements: 必含要素列表（缺失即 fail）
     - regex_patterns: [{pattern, must_match: bool}]（正则匹配判定）
     - amount_thresholds: [{field, max}]（金额上限判定）
-    - amount_pair_diff: [{a_field, b_field, max_abs_diff, fail_when}]（两金额差值比较）
+    - amount_pair_diff: [{a_field, b_field, max_abs_diff|max_ratio, ratio_base, fail_when}]
+      （两金额差值比较；max_abs_diff 为绝对阈值「元」，max_ratio 为相对阈值比例，
+      如 0.1 表示「差值 < 基准值的 10%」，ratio_base 取 "a"|"b" 指定分母）
     - consistency_elements: 一致性核查核心要素 [{name, synonyms, note}]
     """
     if not isinstance(raw, dict):
@@ -943,18 +964,28 @@ def _normalize_structured(raw: Any) -> dict[str, Any] | None:
             b_fields = [str(x).strip() for x in (p.get("b_field") or p.get("b") or []) if str(x).strip()]
             if not a_fields or not b_fields:
                 continue
-            try:
-                thr = float(p.get("max_abs_diff", 0))
-            except (TypeError, ValueError):
+            # 阈值二选一：max_abs_diff（绝对，元）或 max_ratio（相对，比例）。
+            # 相对阈值用于「差值小于暂估价的 10%」这类随基准值浮动的规则 —— 这类规则
+            # 无法用固定金额表达，此前只能回落 LLM，导致同一份文件反复出现
+            # 「文本算对、结构化字段填错」的自相矛盾结论（降级为待人工复核）。
+            thr = _opt_float(p.get("max_abs_diff"))
+            ratio = _opt_float(p.get("max_ratio"))
+            if thr is None and ratio is None:
                 continue
-            norm_apd.append(
-                {
-                    "a_field": a_fields,
-                    "b_field": b_fields,
-                    "max_abs_diff": thr,
-                    "fail_when": str(p.get("fail_when", "le")).lower(),
-                }
-            )
+            base = str(p.get("ratio_base", "a") or "a").strip().lower()
+            if base not in ("a", "b"):
+                base = "a"
+            entry: dict[str, Any] = {
+                "a_field": a_fields,
+                "b_field": b_fields,
+                "fail_when": str(p.get("fail_when", "le")).lower(),
+            }
+            if thr is not None:
+                entry["max_abs_diff"] = thr
+            if ratio is not None:
+                entry["max_ratio"] = ratio
+                entry["ratio_base"] = base
+            norm_apd.append(entry)
         if norm_apd:
             out["amount_pair_diff"] = norm_apd
     return out if out else None

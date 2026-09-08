@@ -10,7 +10,12 @@ export interface StructuredCondition {
   amount_pair_diff?: {
     a_field: string[]
     b_field: string[]
-    max_abs_diff: number
+    /** 绝对阈值（元）。与 max_ratio 二选一。 */
+    max_abs_diff?: number
+    /** 相对阈值比例，0.1 = 基准值的 10%。与 max_abs_diff 二选一。 */
+    max_ratio?: number
+    /** 相对阈值分母取自 a 还是 b，默认 a。 */
+    ratio_base?: 'a' | 'b'
     fail_when?: string
   }[]
   consistency_elements?: unknown[]
@@ -154,8 +159,33 @@ export interface Rule {
   need_legal_basis: boolean
   /** 关联的文档类型；为空表示适用于全部文件，否则仅对匹配类型的文件执行本规则审核 */
   doc_types: string[]
+  /**
+   * 关联的章节；为空表示不按章节裁剪（对文档全文审核）。
+   * 章节以文件类型为维度，审核时按每个文件自身的类型取「section_ids ∩ 该类型章节」，
+   * 仅对命中章节的正文执行本规则；文档未命中任何关联章节时不产生结论。
+   */
+  section_ids?: string[]
   builtin?: boolean
   structured?: RuleStructured | null
+}
+
+/** 章节（以文件类型为维度）：规范名 + 同义写法，用于按章节裁剪送审正文 */
+export interface Section {
+  id: string
+  file_type_id: string
+  name: string
+  synonyms: string[]
+  note?: string
+  builtin?: boolean
+  enabled?: boolean
+}
+
+/** 章节在某文档上的命中预览 */
+export interface SectionPreviewHit {
+  section_id: string
+  name: string
+  headings: string[]
+  chars: number
 }
 
 /** 一组规则聚合出的一致性核查规格 */
@@ -606,6 +636,26 @@ export interface KnowledgeBase {
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 /** 单条规则的聚合审核结果（按 rule_id 把分段/多文档并行产生的 N 条结论合并为一条） */
+/** 规则维度下钻：单文件的结论明细组（后端 _aggregate_rule_results.file_results） */
+export interface RuleFileResult {
+  /** 文件名；确定性结论等未关联文件的条目归入「（未关联文件）」 */
+  file: string
+  /** 该文件下该规则的整体结论（组内最严重项） */
+  status: FindingStatus
+  /** 该文件下 fail/warn/unknown 的条数 */
+  issue_count: number
+  /** 逐条审核结论明细 */
+  findings: {
+    status: FindingStatus
+    title: string
+    detail: string
+    evidence: string
+    location: string
+    suggestion: string
+    confidence?: number | null
+  }[]
+}
+
 export interface RuleResult {
   rule_id: string
   rule_name: string
@@ -617,6 +667,9 @@ export interface RuleResult {
   issue_count: number
   /** 前几条问题标题样例，便于结果卡片快速预览 */
   samples: string[]
+  /** 文件级结论明细：从规则行下钻查看该规则针对不同文件的逐条结论。
+   *  历史任务可能缺失（该字段后加入），缺失时前端从 findings 按 involved_files 现场推导。 */
+  file_results?: RuleFileResult[]
 }
 
 /** 过程日志条目（与后端任务存储对齐） */

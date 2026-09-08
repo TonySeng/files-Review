@@ -64,9 +64,9 @@ _BUILTIN_REVIEW_RULE = """请依据以下规则审核文件.{{context_note}}
   "findings": [
     {
       "rule_id": "规则ID",
+      "detail": "判定理由:先摘录原文并做算术校验,再给出结论(见下方填写顺序)",
+      "title": "一句话结论(必须与 detail 的结论一致)",
       "status": "pass|fail|warn|unknown",
-      "title": "一句话结论",
-      "detail": "判定理由,说明核查过程",
       "evidence": "文档原文摘录(不超过200字),注明所在文件与页码",
       "location": "文件名 第X页/第X章",
       "suggestion": "整改建议,status=pass 时留空",
@@ -78,6 +78,15 @@ _BUILTIN_REVIEW_RULE = """请依据以下规则审核文件.{{context_note}}
   ]
 }
 必须覆盖全部 {{rule_count}} 条规则, rule_id 必须与上文一致. 只输出 JSON.
+
+【填写顺序(强制)】
+上面 JSON 中字段的先后顺序就是你的思考顺序,必须严格按此顺序逐字段生成:
+1. 先写 detail:摘录原文取值 → 做算术校验(金额/比例/工期必须写出完整算式与结果) → 在末尾写出明确结论词(pass/fail/warn/unknown).
+2. 再写 title 与 status:status 必须复制 detail 末尾给出的结论词,不得另起炉灶.
+3. 严禁先定 status 再倒推理由:那会导致「status 填 fail 而 detail 结论为通过」的自相矛盾,
+   这类矛盾会被系统检出并强制降级为「待人工复核」,使本次审核作废.
+4. 数值类规则尤其注意:只有当数值**满足规则的触发条件**时才填 fail;
+   数值落在合规区间内时,即使规则名称含「异常/风险/敏感度」等字样,也必须填 pass.
 
 错别字/标点符号类规则(rule_id 为 gen-typo):
 - 当 status 为 fail 或 warn 且存在字词替换类错误时,务必填写 "typo" 字段以提供结构化错字信息。
@@ -233,11 +242,14 @@ _BUILTIN_MINING_SYSTEM = """你是法规结构化抽取引擎，负责把法律�
     "forbid_keywords": ["命中即违规的禁止性词语"],            // 条款明令禁止出现的表述，如 "串通投标"
     "require_elements": ["文件必须包含的要素词"],              // 条款强制要求出现的要素，如 "履约保证金"
     "amount_thresholds": [{"field": "字段名", "max": 800000}], // 金额上限（元），如 投标保证金不得超过项目估算价的2%且不超过80万 → max 直接给绝对上限的元数
-    "amount_pair_diff": [{"a_field": ["字段A"], "b_field": ["字段B"], "max_abs_diff": 0, "fail_when": "le"}]  // 两金额差值比较，仅当条款要求「两个数值应(不)高度相似」时使用
+    "amount_pair_diff": [{"a_field": ["字段A"], "b_field": ["字段B"], "max_abs_diff": 0, "max_ratio": 0.1, "ratio_base": "a", "fail_when": "lt"}]  // 两金额差值比较，仅当条款要求「两个数值应(不)高度相似」时使用
   }
 }
 注意：
 - amount_thresholds 的 max 一律换算为**元**（80万元 → 800000）。
+- amount_pair_diff 的阈值二选一：条款给的是**固定金额**（如"相差不超过5万元"）用 max_abs_diff（换算为元）；
+  条款给的是**比例**（如"差值小于暂估价的10%"）用 max_ratio（0.1 = 10%）+ ratio_base（"a"|"b" 指定以哪个字段作分母）。
+  fail_when 语义：le=差值≤阈值即违规、lt=差值<阈值、ge=差值≥阈值、gt=差值>阈值。
 - 时限类条件（如"30日内"）无法用上述形态表达，**不要**硬套 amount_thresholds，留给 checkpoints 人工核查。
 - structured_hint 与 checkpoints 并不冲突：hint 供确定性引擎预检，checkpoints 供审核员执行。
 

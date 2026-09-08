@@ -179,6 +179,10 @@ def rule_content_hash(rule: dict[str, Any]) -> str:
         "consistency_elements": ce,
         "thresholds": rule.get("thresholds"),
         "focus": rule.get("focus"),
+        # 关联文档类型/章节会改变送审正文范围，必须纳入指纹，
+        # 否则「改了章节但缓存未失效」会返回按旧范围得出的结论。
+        "doc_types": rule.get("doc_types"),
+        "section_ids": rule.get("section_ids"),
     }
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]

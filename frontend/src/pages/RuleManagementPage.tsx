@@ -93,6 +93,8 @@ export default function RuleManagementPage({
   const [sevFilter, setSevFilter] = useState<Severity | 'all'>('all')
   // 文档类型 id→name 映射，用于规则卡片展示「关联文档类型」
   const [fileTypeMap, setFileTypeMap] = useState<Record<string, string>>({})
+  // 章节 id→name 映射，用于规则卡片展示「关联章节」
+  const [sectionMap, setSectionMap] = useState<Record<string, string>>({})
 
   useEffect(() => {
     let alive = true
@@ -103,6 +105,22 @@ export default function RuleManagementPage({
         const m: Record<string, string> = {}
         for (const ft of (r.file_types || []) as FileType[]) m[ft.id] = ft.name
         setFileTypeMap(m)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  useEffect(() => {
+    let alive = true
+    api
+      .listSections()
+      .then((r) => {
+        if (!alive) return
+        const m: Record<string, string> = {}
+        for (const s of r.sections || []) m[s.id] = s.name
+        setSectionMap(m)
       })
       .catch(() => {})
     return () => {
@@ -686,6 +704,17 @@ export default function RuleManagementPage({
                                   .join('、')}
                               </Tag>
                             ) : null}
+                            {rule.section_ids?.length ? (
+                              <Tooltip
+                                title={`仅审核这些章节：${rule.section_ids
+                                  .map((sid) => sectionMap[sid] || sid)
+                                  .join('、')}`}
+                              >
+                                <Tag color="purple" style={{ marginInlineEnd: 0 }}>
+                                  章节 {rule.section_ids.length} 项
+                                </Tag>
+                              </Tooltip>
+                            ) : null}
                           </div>
                           {rule.description && (
                             <div className="rm-rule-card-desc">{rule.description}</div>
@@ -756,6 +785,7 @@ export default function RuleManagementPage({
         open={detailOpen}
         rule={detailRule}
         isPreset={isPreset}
+        sectionMap={sectionMap}
         onClose={() => setDetailOpen(false)}
         onEdit={(r) => {
           setDetailOpen(false)

@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator
 
 from .. import config
 from . import consistency_cache, feedback_store, findings_cache, kb_client, llm_client, prompts, rules_store, web_search_client
+from . import sections as sections_store
 from . import versioning
 from .doc_parser import truncate
 
@@ -167,6 +168,144 @@ async def _build_docs_text(
     return ("\n\n".join(blocks) if blocks else "（无可用文本内容）", per_doc, per_doc_blocks)
 
 
+def _truncate_docs_text(text: str, max_chars: int) -> str:
+    """将送审正文截断到 max_chars 以内，尽量保留所有文档块（每块按比例截断尾部）。
+
+    仅用于上下文超长降级：优先按比例裁掉每块尾部，避免直接按整串头部截断
+    导致后续文档整块丢失。delimiter 行以 ``=====`` 开头（见 _build_docs_text）。
+    """
+    if len(text) <= max_chars:
+        return text
+    parts = re.split(r"(?m)^(=====.*?=====)\n", text)
+    head = parts[0] if parts else ""
+    blocks: list[tuple[str, str]] = []
+    i = 1
+    while i + 1 < len(parts):
+        blocks.append((parts[i], parts[i + 1]))
+        i += 2
+    if not blocks:
+        return text[:max_chars]
+    per = max(200, (max_chars - len(head)) // max(1, len(blocks)))
+    out = [head]
+    for delim, body in blocks:
+        out.append(delim + "\n")
+        out.append(body[:per])
+    return "".join(out)
+
+
+async def _run_rule_prompt_guarded(
+    batch: list[dict[str, Any]],
+    docs_text: str,
+    tender_summary: str,
+    extra_instruction: str | None,
+    *,
+    mode: str,
+    kb_text: str,
+    run_kb: bool,
+    kb_id: str | None,
+    web_search_enabled: bool,
+    on_event: Any,
+    rules: list[dict[str, Any]],
+    kb_cache: dict,
+    cache_prefix: str,
+    temperature: float | None,
+    kb_state: dict | None,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """带「上下文超长多级降级」的单 prompt 审核调用（Fix：上线频繁上下文超长 400）。
+
+    降级层级（每级均 emit 进度/警告，便于界面观察）：
+      L0 原始：base_prompt + KB 依据
+      L1 丢弃 KB 依据（最大单项裁剪，且关闭 KB 工具避免模型回捞依据再超长）
+      L2 截断送审正文至预算 ~50%
+      L3 截断送审正文至预算 ~20%
+    任一层级真实命中 LLMContextOverflow 仍超长，或已达最大降级次数，则抛出交由上层告警跳过。
+
+    发前 token 预算：拼好的 messages 估算超 ``llm_max_input_tokens`` 即主动降级，
+    省一次必败的模型调用（真实 400 仍由 llm_client 识别并触发同款降级）。
+    """
+    budget = int(config.get("llm_max_input_tokens", 60000))
+    max_degrade = int(config.get("llm_context_overflow_max_degrade", 3))
+    base_prompt = prompts.build_rule_prompt(
+        batch, docs_text, tender_summary, extra_instruction, mode=mode
+    )
+    # 系统提示 + 工具 schema 的固定开销（近似），用于发前预算判断
+    overhead_tokens = llm_client.estimate_tokens(prompts.system_prompt()) + 1000
+
+    def _tok(prompt: str, kb: str) -> int:
+        return (
+            overhead_tokens
+            + llm_client.estimate_tokens(prompt)
+            + (llm_client.estimate_tokens(kb) if kb else 0)
+        )
+
+    use_kb = bool(kb_text)
+    text = docs_text
+    last_exc: Exception | None = None
+    for level in range(0, max_degrade + 1):
+        kb = kb_text if use_kb else ""
+        prompt = base_prompt
+        if level >= 1:
+            # L1：丢弃 KB 依据（最大单项裁剪）
+            kb = ""
+            use_kb = False
+        if level >= 2:
+            # L2/L3：截断送审正文（1.5 token/char 反推字符预算）
+            ratio = 0.5 if level == 2 else 0.2
+            max_chars = max(2000, int(budget * ratio / 1.5))
+            text = _truncate_docs_text(text, max_chars)
+            prompt = prompts.build_rule_prompt(
+                batch, text, tender_summary, extra_instruction, mode=mode
+            )
+        # 发前预算检查：未触发真实 400 即主动降级（省一次必败调用）
+        if _tok(prompt, kb) > budget and level < max_degrade:
+            if level == 0:
+                await on_event(
+                    {
+                        "type": "stage", "stage": "rules",
+                        "message": (
+                            f"批次预估 token≈{_tok(prompt, kb)} 超预算 {budget}，"
+                            f"自动降级（丢弃知识库依据）"
+                        ),
+                    }
+                )
+            continue
+        full = prompt
+        if kb:
+            full = (
+                f"{prompt}\n\n# 法规依据（来自知识库预检索，供本批次核查参考）\n{kb}"
+            )
+        try:
+            return await _run_with_kb(
+                full,
+                kb_enabled=run_kb and bool(kb),
+                kb_id=kb_id,
+                web_search_enabled=web_search_enabled,
+                on_event=on_event,
+                rules=rules,
+                kb_cache=kb_cache,
+                cache_prefix=cache_prefix,
+                temperature=temperature,
+                kb_state=kb_state,
+            )
+        except llm_client.LLMContextOverflow as exc:
+            last_exc = exc
+            if level < max_degrade:
+                await on_event(
+                    {
+                        "type": "warning",
+                        "message": (
+                            f"批次上下文超长，自动降级（层级 {level + 1}）："
+                            f"{'丢弃知识库依据' if level == 0 else '截断送审正文'}"
+                        ),
+                    }
+                )
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    return None, []
+
+
 def _rule_doc_type_filter(batch: list[dict[str, Any]]) -> set[str] | None:
     """返回批次关联文档类型集合；若批次内所有规则均未限定文档类型，返回 None（适用于全部文件）。
 
@@ -188,6 +327,66 @@ def _applicable_docs(
     if types is None:
         return list(docs)
     return [d for d in docs if (d.get("file_type") or None) in types]
+
+
+def _batch_section_ids(batch: list[dict[str, Any]]) -> list[str]:
+    """批次关联章节 id 并集；批次内所有规则均未关联章节时返回空列表（=全量审核）。
+
+    常规批次为「一条规则一批」；仅校对类规则合并成批——这类规则通常不配置章节，
+    因此取并集不会造成范围放大。
+    """
+    ids: list[str] = []
+    for r in batch or []:
+        for sid in r.get("section_ids") or []:
+            sid = str(sid).strip()
+            if sid and sid not in ids:
+                ids.append(sid)
+    return ids
+
+
+def _doc_label(doc: dict[str, Any]) -> str:
+    role_label = {"tender": "招标文件", "bid": "投标文件", "attachment": "附件"}
+    return doc.get("file_type_name") or role_label.get(doc.get("role", "bid"), "文件")
+
+
+def _section_scoped(
+    batch_docs: list[dict[str, Any]], section_ids: list[str]
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """按关联章节裁剪送审文档。
+
+    章节以文件类型为维度：只取「文档自身 file_type 下、且 id 在 section_ids 中」的章节；
+    命中则仅把命中章节的正文作为该文档的送审内容，未命中任何章节的文档直接剔除。
+
+    返回 (scoped_docs, blocks, hit_names)：
+      - scoped_docs：命中文档副本，parsed_hash 替换为「裁剪后正文」的指纹，
+        使结论缓存随章节范围变化而失效（避免复用旧范围的结论）；
+      - blocks：带标签头的送审文本块，与全量路径格式保持一致；
+      - hit_names：命中的章节名（用于进度提示）。
+    """
+    limit = int(config.get("max_chars_per_doc", 60000))
+    scoped_docs: list[dict[str, Any]] = []
+    blocks: list[str] = []
+    hit_names: list[str] = []
+    for doc in batch_docs:
+        defs = sections_store.for_file_type(section_ids, doc.get("file_type"))
+        if not defs:
+            continue  # 该文件类型下没有关联章节 → 本文档不参与本规则审核
+        body, names = sections_store.scope_text(doc.get("text") or "", defs)
+        if not body.strip():
+            continue  # 文档里找不到这些章节 → 本文档不参与
+        shown = truncate(body, limit)
+        label = _doc_label(doc)
+        filename = doc.get("filename", "未命名文件")
+        blocks.append(
+            f"===== 【{label}】{filename} （章节范围：{'、'.join(names)}）=====\n{shown}"
+        )
+        scoped_docs.append(
+            dict(doc, parsed_hash=versioning.parsed_content_hash(shown))
+        )
+        for n in names:
+            if n not in hit_names:
+                hit_names.append(n)
+    return scoped_docs, blocks, hit_names
 
 
 def _split_text(text: str, size: int) -> list[str]:
@@ -743,6 +942,10 @@ async def _run_with_kb(
                 # 「工具不支持」之外的异常：若是瞬时限流/过载/网络抖动，由 llm_client 内部退避重试处理，
                 # 此处不再额外发起一次「无工具整批重试」，避免对过载的提供方加倍施压（曾出现 17 次双倍重试）。
                 # 仅当属非瞬时错误（如模型输出解析问题）时才降级无工具模式补全本批。
+                # 上下文超长须立即上抛：用同一份超长 prompt 再发一次毫无意义，
+                # 且下方「补做检索规划」会重新注入 KB 依据令其更长——必须由调用方降级（丢 KB/截正文）后重试。
+                if isinstance(exc, llm_client.LLMContextOverflow):
+                    raise
                 if _is_transient_llm_error(exc):
                     logger.warning("审核主调用瞬时故障(限流/过载/抖动)，交由上层退避重试: %s", exc)
                     raise
@@ -1183,6 +1386,52 @@ def _aggregate_rule_results(
         by_rule.setdefault(rid, []).append(f)
     order = {"fail": 0, "warn": 1, "unknown": 2, "pass": 3}
     name_of = {v: k for k, v in order.items()}
+
+    def _file_results(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把一条规则下的若干结论按「文件」维度归组，供前端从规则下钻查看逐条结论。
+
+        归组口径：按 finding.involved_files 归属——跨文件结论（involved_files 列多个文件）
+        归入其列出的每个文件（该结论确实同时涉及这些文件）；未关联文件的结论（如确定性
+        规则结论）归入「（未关联文件）」桶，保证下钻不丢条目。文件组的 status 取组内
+        最严重结论，issue_count 统计组内 fail/warn/unknown 条数。
+        """
+
+        def _status_of(it: dict[str, Any]) -> str:
+            return str(it.get("status") or "pass")
+
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for it in items:
+            files = [str(x) for x in (it.get("involved_files") or []) if str(x).strip()]
+            for fname in files or ["（未关联文件）"]:
+                groups.setdefault(fname, []).append(it)
+        out_files: list[dict[str, Any]] = []
+        for fname, its in groups.items():
+            worst = min((order.get(_status_of(it), 3) for it in its), default=3)
+            out_files.append(
+                {
+                    "file": fname,
+                    "status": name_of[worst],
+                    "issue_count": sum(
+                        1 for it in its if _status_of(it) in ("fail", "warn", "unknown")
+                    ),
+                    "findings": [
+                        {
+                            "status": _status_of(it),
+                            "title": str(it.get("title") or ""),
+                            "detail": str(it.get("detail") or ""),
+                            "evidence": str(it.get("evidence") or ""),
+                            "location": str(it.get("location") or ""),
+                            "suggestion": str(it.get("suggestion") or ""),
+                            "confidence": it.get("confidence"),
+                        }
+                        for it in its
+                    ],
+                }
+            )
+        # 文件名排序保证多次查询返回顺序稳定
+        out_files.sort(key=lambda x: x["file"])
+        return out_files
+
     out: list[dict[str, Any]] = []
     for r in rules:
         rid = str(r.get("id") or "")
@@ -1212,6 +1461,8 @@ def _aggregate_rule_results(
                 "status": status,
                 "issue_count": issue_count,
                 "samples": samples,
+                # 文件级结论明细：前端可从规则行下钻，查看该规则针对每个文件的逐条结论
+                "file_results": _file_results(items),
             }
         )
     return out
@@ -1260,6 +1511,7 @@ def _extract_amount_near(text: str, field) -> float | None:
 
     抽取策略：优先在字段名「之后」搜索（字段名在前、金额在后的主流语序，如「暂估价44万元」），
     向后窗口不会误吞前序其他字段的金额；仅当向后搜索失败时，才向前兜底（覆盖「44万元暂估价」）。
+    后置单位缺失时还会识别「单位前置」写法（如「暂估价(万元) 172.7」→ 1,727,000 元）。
     """
     if not text:
         return None
@@ -1277,6 +1529,23 @@ def _extract_amount_near(text: str, field) -> float | None:
             mult = 1000.0
         return val * mult
 
+    def _leading_unit(prefix: str) -> str | None:
+        """识别「单位前置」写法（如「暂估价(万元) 172.7」→ 万）。
+
+        表头/分项表里单位常写在数字**前面**，此时数字后面没有单位，只按后置单位解析
+        会把 172.7 万元读成 172.7 元，与「中标价 152万元」(1,520,000 元) 相差百万倍，
+        差值比较必然失真。故后置单位缺失时，回看数字前的短前缀是否就是单位声明。
+        前缀限长 4 字——过长说明中间夹了别的词（如「(万元)：本次招标控制价 5000」），
+        单位与数字已非直接修饰关系，此时宁可不套用，避免错乘。
+        """
+        s = _re.sub(r"[\s:：为（(）)\[\]【】,，]", "", prefix or "")
+        if not s or len(s) > 4:
+            return None
+        for unit in ("万元", "亿元", "千元"):
+            if s.endswith(unit):
+                return unit[0]
+        return None
+
     for cand in candidates:
         idx = text.lower().find(cand.lower())
         if idx < 0:
@@ -1287,7 +1556,8 @@ def _extract_amount_near(text: str, field) -> float | None:
         m = _re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(万|千|亿)?", fwd)
         if m:
             try:
-                return _apply_unit(float(m.group(1)), m.group(2))
+                unit = m.group(2) or _leading_unit(fwd[: m.start()])
+                return _apply_unit(float(m.group(1)), unit)
             except (TypeError, ValueError):
                 pass
         # 2) 兜底向前：字段名之前 30 字内最后一个金额（如「44万元暂估价」）
@@ -1300,6 +1570,16 @@ def _extract_amount_near(text: str, field) -> float | None:
             except (TypeError, ValueError):
                 pass
     return None
+
+
+def _opt_float(val: Any) -> float | None:
+    """宽松转 float：None/空串/非法值 → None（区分「未配置」与「阈值就是 0」）。"""
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
 
 
 def _pair_is_violation(diff: float, threshold: float, fail_when: str) -> bool:
@@ -1374,7 +1654,25 @@ def _apply_structured_rules(
         rid = str(rule.get("id") or "")
         # 按规则关联文档类型过滤适用文档，仅用其文本做判定
         types = _rule_doc_type_filter([rule])
-        if types is None:
+        # 章节关联：规则指定了章节时，仅用命中章节的正文做可计算判定。
+        # 注意此处必须用文档原文（per_doc_full 可能是超大文档的"分片摘要"，
+        # 摘要里没有章节结构，无法按章节裁剪）。
+        sec_ids = [
+            str(x).strip() for x in (rule.get("section_ids") or []) if str(x).strip()
+        ]
+        if sec_ids:
+            parts: list[str] = []
+            for d in docs:
+                if types is not None and (d.get("file_type") or None) not in types:
+                    continue
+                defs = sections_store.for_file_type(sec_ids, d.get("file_type"))
+                if not defs:
+                    continue
+                body, _names = sections_store.scope_text(d.get("text") or "", defs)
+                if body.strip():
+                    parts.append(body)
+            rule_text = "\n\n".join(parts) or ""
+        elif types is None:
             rule_text = "\n\n".join(b for b in per_doc_full if b) or ""
         else:
             rule_idx = [i for i, d in enumerate(docs) if (d.get("file_type") or None) in types]
@@ -1443,11 +1741,14 @@ def _apply_structured_rules(
             b_fields = _as_field_list(pd.get("b_field") or pd.get("b"))
             if not a_fields or not b_fields:
                 continue
-            try:
-                threshold = float(pd.get("max_abs_diff", 0) or 0)
-            except (TypeError, ValueError):
-                continue
             fail_when = str(pd.get("fail_when", "le")).lower()
+            abs_thr = _opt_float(pd.get("max_abs_diff"))
+            ratio = _opt_float(pd.get("max_ratio"))
+            if abs_thr is None and ratio is None:
+                continue
+            ratio_base = str(pd.get("ratio_base", "a") or "a").strip().lower()
+            if ratio_base not in ("a", "b"):
+                ratio_base = "a"
             va = _extract_amount_near(rule_text, a_fields)
             vb = _extract_amount_near(rule_text, b_fields)
             if va is None or vb is None:
@@ -1455,15 +1756,34 @@ def _apply_structured_rules(
                 pair_missing = True
                 continue
             diff = abs(va - vb)
+            # 阈值取用优先级：相对阈值（基准值 × 比例）> 绝对阈值（元）。
+            # 相对阈值用于「差值小于暂估价的 10%」这类随基准浮动的规则——此前只能用
+            # 固定金额近似或直接回落 LLM，导致同一文件反复出现「文本算对、结构化
+            # 字段填错」的自相矛盾结论（被降级为待人工复核）。
+            ratio_note = ""
+            if ratio is not None:
+                base_val = va if ratio_base == "a" else vb
+                if base_val <= 0:
+                    pair_missing = True
+                    continue
+                threshold = base_val * ratio
+                ratio_note = (
+                    f"，差异率 {diff / base_val * 100:.2f}%"
+                    f"（阈值 {ratio * 100:.2f}%，以 {ratio_base.upper()} 为分母）"
+                )
+            else:
+                threshold = float(abs_thr or 0.0)
+            op = {"le": "≤", "lt": "<", "ge": "≥", "gt": ">"}.get(fail_when, "≤")
             if _pair_is_violation(diff, threshold, fail_when):
                 problems.append(
                     f"「{a_fields[0]}」{va:,.2f}元 与 「{b_fields[0]}」{vb:,.2f}元 "
-                    f"相差 {diff:,.2f}元（≤{threshold:,.2f}元），构成高度相似"
+                    f"相差 {diff:,.2f}元（{op}{threshold:,.2f}元{ratio_note}），构成高度相似"
                 )
             else:
                 pair_pass_notes.append(
                     f"「{a_fields[0]}」{va:,.2f}元 与 「{b_fields[0]}」{vb:,.2f}元 "
-                    f"相差 {diff:,.2f}元（>{threshold:,.2f}元），不构高度相似，判定通过"
+                    f"相差 {diff:,.2f}元（不满足「{op}{threshold:,.2f}元」的触发条件"
+                    f"{ratio_note}），不构成高度相似，判定通过"
                 )
 
         if problems:
@@ -1680,13 +2000,22 @@ async def _run_rule_per_file(
     results = await asyncio.gather(*[run_one(d) for d in docs], return_exceptions=True)
     raws: list[Any] = []
     all_traces: list[dict[str, Any]] = []
+    overflow: Exception | None = None
     for r in results:
         if isinstance(r, Exception):
+            if isinstance(r, llm_client.LLMContextOverflow) and overflow is None:
+                overflow = r
             logger.warning("按文件审核单文件失败(跳过该文件): %s", r)
             continue
         if isinstance(r, tuple) and len(r) == 2:
             raws.append(r[0])
             all_traces.extend(r[1] or [])
+    # 关键：全部文件均因「上下文超长」失败时必须上抛，交由调用方降级（丢弃 KB 依据后整体重试）。
+    # 否则该异常会被上面的 per-file 容错吞掉，静默变成「整批无结论」且无任何补救——
+    # 这正是上线后「频繁超长却看不到降级」的隐蔽路径之一。
+    # 仅当有文件已成功时才保留部分结论，避免为了降级而丢弃已拿到的有效结果。
+    if not raws and overflow is not None:
+        raise overflow
     if not raws:
         return None, all_traces
     return _merge_segment_raws(raws), all_traces
@@ -2040,12 +2369,36 @@ async def run_review(
                             }
                         )
                         return idx, [], []
-                    batch_doc_ids = {id(d) for d in batch_docs}
-                    applicable_idx = [i for i, d in enumerate(docs) if id(d) in batch_doc_ids]
-                    batch_docs_text = (
-                        "\n\n".join(per_doc_blocks[i] for i in applicable_idx)
-                        or "（无可用文本内容）"
-                    )
+                    # 章节关联：规则指定了关联章节时，仅对「命中章节」的正文执行审核，
+                    # 其余章节直接跳过；未指定章节时沿用原有全量审核逻辑。
+                    section_ids = _batch_section_ids(batch)
+                    if section_ids:
+                        scoped_docs, scoped_blocks, hit_names = _section_scoped(
+                            batch_docs, section_ids
+                        )
+                        if not scoped_docs:
+                            names = ", ".join(
+                                str(r.get("name") or r.get("id")) for r in batch
+                            )
+                            await emit(
+                                {
+                                    "type": "stage", "stage": "rules",
+                                    "message": f"规则（{names}）关联的章节在文档中未找到，跳过（不产生结论）",
+                                    "progress": round((idx - 1) / total * 100),
+                                }
+                            )
+                            return idx, [], []
+                        batch_docs = scoped_docs
+                        batch_docs_text = "\n\n".join(scoped_blocks) or "（无可用文本内容）"
+                    else:
+                        batch_doc_ids = {id(d) for d in batch_docs}
+                        applicable_idx = [
+                            i for i, d in enumerate(docs) if id(d) in batch_doc_ids
+                        ]
+                        batch_docs_text = (
+                            "\n\n".join(per_doc_blocks[i] for i in applicable_idx)
+                            or "（无可用文本内容）"
+                        )
 
                     # 结果缓存（方案 C）：相同输入复用历史批次结论，跳过 LLM 调用。
                     # 仅当存在需 LLM 判定的规则时适用；整批锁定的分支维持原逻辑。
@@ -2176,23 +2529,43 @@ async def run_review(
                                     temperature=det_temperature, kb_state=kb_state,
                                     batch_kb_context=batch_kb_context,
                                 )
+                            except llm_client.LLMContextOverflow as exc:
+                                # 按文件切片仍超长（单文件过大 + KB 依据）：丢弃 KB 依据重试一次，
+                                # 关闭 KB 工具避免模型回捞依据再次撑爆上下文。
+                                logger.warning("规则批次(按文件)上下文超长，丢弃 KB 依据重试: %s", exc)
+                                await emit({"type": "warning", "message": "批次上下文超长，已丢弃知识库依据重试"})
+                                try:
+                                    raw, traces = await _run_rule_per_file(
+                                        batch, batch_docs, tender_summary, extra_instruction,
+                                        mode=mode,
+                                        kb_enabled=False, kb_id=kb_id,
+                                        web_search_enabled=web_search_enabled,
+                                        on_event=emit, rules=batch,
+                                        kb_cache=kb_cache, cache_prefix=cache_prefix,
+                                        temperature=det_temperature, kb_state=kb_state,
+                                        batch_kb_context="",
+                                    )
+                                except llm_client.LLMError as exc2:
+                                    logger.error("规则批次(按文件)审核失败: %s", exc2)
+                                    await emit({"type": "warning", "message": f"批次审核失败: {exc2}"})
+                                    raw, traces = None, []
                             except llm_client.LLMError as exc:
                                 logger.error("规则批次(按文件)审核失败: %s", exc)
                                 await emit({"type": "warning", "message": f"批次审核失败: {exc}"})
                                 raw, traces = None, []
                         else:
-                            prompt = prompts.build_rule_prompt(
-                                batch, batch_docs_text, tender_summary, extra_instruction, mode=mode
-                            )
-                            if batch_kb_context:
-                                prompt = (
-                                    f"{prompt}\n\n# 法规依据（来自知识库预检索，供本批次核查参考）\n"
-                                    f"{batch_kb_context}"
-                                )
+                            # 单 prompt 路径（非分段、非按文件）：可能因注入 KB 依据 + 多文档全文
+                            # 而超过模型上下文窗口。接入「发前 token 预算 + 上下文超长多级降级」，
+                            # 确保大文档审核不静默失败（降级细节见 _run_rule_prompt_guarded）。
                             try:
-                                raw, traces = await _run_with_kb(
-                                    prompt,
-                                    kb_enabled=run_kb,
+                                raw, traces = await _run_rule_prompt_guarded(
+                                    batch,
+                                    batch_docs_text,
+                                    tender_summary,
+                                    extra_instruction,
+                                    mode=mode,
+                                    kb_text=batch_kb_context,
+                                    run_kb=run_kb,
                                     kb_id=kb_id,
                                     web_search_enabled=web_search_enabled,
                                     on_event=emit,
@@ -2238,18 +2611,14 @@ async def run_review(
                             raw = _merge_raw(raw, r2)
                             missing = _missing_rule_ids(raw, llm_rules)
                             continue
-                        miss_prompt = prompts.build_rule_prompt(
-                            miss_rules, batch_docs_text, tender_summary, extra_instruction, mode=mode
-                        )
-                        if batch_kb_context:
-                            miss_prompt = (
-                                f"{miss_prompt}\n\n# 法规依据（来自知识库预检索，供本批次核查参考）\n"
-                                f"{batch_kb_context}"
-                            )
+                        # 缺失规则补答：单 prompt 路径同样接入上下文超长降级，
+                        # 复用 _run_rule_prompt_guarded（与主批一致），避免重试时再次超长静默失败。
                         try:
-                            r2, t2 = await _run_with_kb(
-                                miss_prompt,
-                                kb_enabled=run_kb,
+                            r2, t2 = await _run_rule_prompt_guarded(
+                                miss_rules, batch_docs_text, tender_summary, extra_instruction,
+                                mode=mode,
+                                kb_text=batch_kb_context,
+                                run_kb=run_kb,
                                 kb_id=kb_id,
                                 web_search_enabled=web_search_enabled,
                                 on_event=emit,
@@ -2259,7 +2628,7 @@ async def run_review(
                                 temperature=det_temperature,
                                 kb_state=kb_state,
                             )
-                            traces.extend(t2)
+                            traces.extend(t2 or [])
                         except llm_client.LLMError as exc:
                             logger.warning("缺失规则补答失败(放弃本轮): %s", exc)
                             break

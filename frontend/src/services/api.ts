@@ -19,6 +19,8 @@ import type {
   ReviewTaskSummary,
   RuleGroup,
   RuleSet,
+  Section,
+  SectionPreviewHit,
   LegalRuleset,
   LegalRulesetRule,
   LegalSourceMeta,
@@ -355,6 +357,48 @@ export const api = {
 
   deleteFileType(id: string) {
     return request<{ deleted: boolean }>(`/file-types/${id}`, { method: 'DELETE' })
+  },
+
+  // ---------------- 章节库配置 ----------------
+  listSections(fileTypeId?: string) {
+    const qs = fileTypeId ? `?file_type_id=${encodeURIComponent(fileTypeId)}` : ''
+    return request<{ sections: Section[] }>(`/sections${qs}`)
+  },
+
+  saveSection(payload: Partial<Section>) {
+    return request<{ section: Section; warnings: string[] }>('/sections', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+
+  deleteSection(id: string) {
+    return request<{ deleted: boolean }>(`/sections/${id}`, { method: 'DELETE' })
+  },
+
+  /** 解析某文档被识别出的章节标题，供配置同义词时快速录入 */
+  parseSectionHeadings(fileId: string) {
+    return request<{
+      file_id: string
+      filename: string
+      file_type: string | null
+      headings: { title: string; raw: string }[]
+    }>(`/sections/parse?file_id=${encodeURIComponent(fileId)}`)
+  },
+
+  /** 预览章节在某文档上的命中情况 */
+  previewSections(fileId: string, sectionIds: string[]) {
+    return request<{
+      file_id: string
+      filename: string
+      file_type: string | null
+      matched: SectionPreviewHit[]
+      missed: string[]
+      all_headings: { title: string; raw: string }[]
+    }>('/sections/preview', {
+      method: 'POST',
+      body: JSON.stringify({ file_id: fileId, section_ids: sectionIds }),
+    })
   },
 
   // ---------------- 审核规则组 ----------------

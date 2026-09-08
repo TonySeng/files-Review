@@ -38,6 +38,7 @@ import type {
   FindingStatus,
   KBTrace,
   ReviewSummary,
+  RuleFileResult,
   RuleResult,
   Severity,
 } from '../types'
@@ -139,9 +140,23 @@ export default function ResultPanel({
     }
   }
 
+  // 为每条结论生成「稳定且唯一」的行键。同一规则可能产出多条结论（例如一条规则触发多个
+  // 检查点、或 auto_match 从多个规则集拉入同名规则），findings 中会存在相同 rule_id 的多条记录。
+  // 若直接用 rule_id 作 Table 的 rowKey，会产生重复的 React key；antd 在切换过滤条件复用行节点时
+  // 会按 key 错误复用，表现为「筛出错误项」「切回全部后顺序与初始不一致」。这里以
+  // 「rule_id + 原始序号」组成稳定键：过滤/切回全部时，同一条结论始终对应同一个 key，
+  // 显示顺序始终与后端返回（原始）顺序一致。
+  const keyedFindings = useMemo(
+    () => findings.map((f, i) => ({ ...f, _key: `${f.rule_id}#${i}` })),
+    [findings],
+  )
+
   const filtered = useMemo(
-    () => (filter === 'all' ? findings : findings.filter((f) => f.status === filter)),
-    [findings, filter],
+    () =>
+      filter === 'all'
+        ? keyedFindings
+        : keyedFindings.filter((f) => f.status === filter),
+    [keyedFindings, filter],
   )
 
   const counts = useMemo(() => {
@@ -151,6 +166,65 @@ export default function ResultPanel({
     })
     return base
   }, [findings])
+
+  // 规则审核结果同样可能含重复 rule_id（跨规则集同名规则），用稳定键避免行键冲突。
+  const keyedRuleResults = useMemo(
+    () => (ruleResults || []).map((r, i) => ({ ...r, _key: `rr-${r.rule_id}#${i}` })),
+    [ruleResults],
+  )
+
+  const FILE_STATUS_ORDER: Record<FindingStatus, number> = {
+    fail: 0,
+    warn: 1,
+    unknown: 2,
+    pass: 3,
+  }
+
+  // 规则维度下钻：取该规则的文件级结论明细。
+  // 优先用后端聚合返回的 file_results；历史任务无该字段时，从 findings 按
+  // involved_files 现场推导（口径与后端 _aggregate_rule_results._file_results 一致：
+  // 跨文件结论归属其列出的每个文件，未关联文件归入「（未关联文件）」）。
+  const resolveFileResults = (rule: RuleResult): RuleFileResult[] => {
+    if (rule.file_results) return rule.file_results
+    const items = findings.filter((f) => f.rule_id === rule.rule_id)
+    const groups = new Map<string, Finding[]>()
+    for (const it of items) {
+      const files = (it.involved_files || [])
+        .map((s) => String(s).trim())
+        .filter(Boolean)
+      for (const fname of files.length ? files : ['（未关联文件）']) {
+        const arr = groups.get(fname) || []
+        arr.push(it)
+        groups.set(fname, arr)
+      }
+    }
+    const out: RuleFileResult[] = []
+    groups.forEach((its, fname) => {
+      const worst = Math.min(
+        ...its.map((it) => FILE_STATUS_ORDER[it.status] ?? 3),
+      )
+      const status =
+        (Object.keys(FILE_STATUS_ORDER) as FindingStatus[]).find(
+          (k) => FILE_STATUS_ORDER[k] === worst,
+        ) ?? 'pass'
+      out.push({
+        file: fname,
+        status,
+        issue_count: its.filter((it) => it.status !== 'pass').length,
+        findings: its.map((it) => ({
+          status: it.status,
+          title: it.title || '',
+          detail: it.detail || '',
+          evidence: it.evidence || '',
+          location: it.location || '',
+          suggestion: it.suggestion || '',
+          confidence: it.confidence,
+        })),
+      })
+    })
+    out.sort((a, b) => a.file.localeCompare(b.file))
+    return out
+  }
 
   const handleExport = async (format: 'word' | 'pdf') => {
     setExporting(true)
@@ -455,9 +529,109 @@ export default function ResultPanel({
                   children: (
                     <Table
                       size="small"
-                      rowKey={(r) => r.rule_id}
+                      rowKey="_key"
                       pagination={false}
-                      dataSource={ruleResults}
+                      dataSource={keyedRuleResults}
+                      expandable={{
+                        // 规则维度下钻：展开查看该规则针对不同文件的逐条审核结论。
+                        // 无任何结论的规则不提供展开（展开无内容可看）。
+                        rowExpandable: (r) => resolveFileResults(r).length > 0,
+                        expandedRowRender: (r) => {
+                          const files = resolveFileResults(r)
+                          if (!files.length) return null
+                          return (
+                            <Collapse
+                              size="small"
+                              items={files.map((fr, i) => ({
+                                key: String(i),
+                                label: (
+                                  <Space size={8} wrap>
+                                    <Tag
+                                      color={STATUS_META[fr.status].color}
+                                      icon={STATUS_META[fr.status].icon}
+                                      style={{ marginRight: 0 }}
+                                    >
+                                      {STATUS_META[fr.status].label}
+                                    </Tag>
+                                    <span style={{ fontSize: 13 }}>{fr.file}</span>
+                                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                      {fr.issue_count > 0
+                                        ? `${fr.issue_count} 条问题`
+                                        : '无问题'}
+                                    </Typography.Text>
+                                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                      {fr.findings.length} 条结论
+                                    </Typography.Text>
+                                  </Space>
+                                ),
+                                children: (
+                                  <Space
+                                    direction="vertical"
+                                    size={10}
+                                    style={{ width: '100%' }}
+                                  >
+                                    {fr.findings.map((fd, j) => (
+                                      <div key={j}>
+                                        <Space size={6} wrap>
+                                          <Tag
+                                            color={STATUS_META[fd.status].color}
+                                            icon={STATUS_META[fd.status].icon}
+                                            style={{ marginRight: 0 }}
+                                          >
+                                            {STATUS_META[fd.status].label}
+                                          </Tag>
+                                          <Typography.Text
+                                            strong={fd.status === 'fail'}
+                                            style={{ fontSize: 13 }}
+                                          >
+                                            {fd.title || '（无结论）'}
+                                          </Typography.Text>
+                                        </Space>
+                                        {fd.detail && (
+                                          <Typography.Text
+                                            type="secondary"
+                                            style={{
+                                              fontSize: 12.5,
+                                              display: 'block',
+                                              lineHeight: 1.75,
+                                              marginTop: 2,
+                                            }}
+                                          >
+                                            {fd.detail}
+                                          </Typography.Text>
+                                        )}
+                                        {fd.evidence && (
+                                          <div className="evidence-block" style={{ marginTop: 4 }}>
+                                            <Typography.Text
+                                              type="secondary"
+                                              style={{ fontSize: 11.5 }}
+                                            >
+                                              原文依据{fd.location ? ` · ${fd.location}` : ''}
+                                            </Typography.Text>
+                                            <div style={{ marginTop: 3 }}>{fd.evidence}</div>
+                                          </div>
+                                        )}
+                                        {fd.suggestion && (
+                                          <Typography.Text
+                                            style={{
+                                              fontSize: 12.5,
+                                              color: '#d4380d',
+                                              display: 'block',
+                                              marginTop: 2,
+                                            }}
+                                          >
+                                            整改建议：{fd.suggestion}
+                                          </Typography.Text>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </Space>
+                                ),
+                              }))}
+                            />
+                          )
+                        },
+                      }}
                       columns={[
                         {
                           title: '状态',
@@ -545,7 +719,7 @@ export default function ResultPanel({
             children: (
               <Table
                 size="small"
-                rowKey={(r) => r.rule_id}
+                rowKey="_key"
                 columns={columns}
                 dataSource={filtered}
                 pagination={false}

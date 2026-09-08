@@ -1,8 +1,15 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { App as AntdApp, Alert, Checkbox, Form, Input, Modal, Select, Space } from 'antd'
 import { SaveOutlined } from '@ant-design/icons'
 import { api } from '../services/api'
-import type { ConsistencyElement, FileType, Rule, RuleSet, Severity } from '../types'
+import type {
+  ConsistencyElement,
+  FileType,
+  Rule,
+  RuleSet,
+  Section,
+  Severity,
+} from '../types'
 import { CATEGORY_LABEL, SEVERITY_META } from './ruleMeta'
 import ConsistencyElementsEditor from './ConsistencyElementsEditor'
 
@@ -21,7 +28,10 @@ export default function RuleEditorModal({ open, ruleset, rule, onCancel, onSaved
   const [elements, setElements] = useState<ConsistencyElement[]>([])
   const [library, setLibrary] = useState<ConsistencyElement[]>([])
   const [fileTypes, setFileTypes] = useState<FileType[]>([])
+  const [sections, setSections] = useState<Section[]>([])
   const category = Form.useWatch('category', form)
+  // 关联章节的可选项随「关联文档类型」联动：章节以文件类型为维度
+  const docTypes = Form.useWatch('doc_types', form) as string[] | undefined
 
   useEffect(() => {
     if (!open) return
@@ -31,6 +41,7 @@ export default function RuleEditorModal({ open, ruleset, rule, onCancel, onSaved
             ...rule,
             checkpoints: rule.checkpoints.join('\n'),
             doc_types: rule.doc_types ?? [],
+            section_ids: rule.section_ids ?? [],
             enabled: rule.enabled ?? true,
             need_legal_basis: !!rule.need_legal_basis,
           }
@@ -43,6 +54,7 @@ export default function RuleEditorModal({ open, ruleset, rule, onCancel, onSaved
             enabled: true,
             need_legal_basis: false,
             doc_types: [],
+            section_ids: [],
           },
     )
     setElements(rule?.structured?.consistency_elements ?? [])
@@ -63,6 +75,36 @@ export default function RuleEditorModal({ open, ruleset, rule, onCancel, onSaved
       .then((r) => setFileTypes(r.file_types || []))
       .catch(() => setFileTypes([]))
   }, [open, fileTypes.length])
+
+  useEffect(() => {
+    if (!open) return
+    api
+      .listSections()
+      .then((r) => setSections(r.sections || []))
+      .catch(() => setSections([]))
+  }, [open])
+
+  // 章节候选：选了文档类型则只列该类型的章节；未选则列出全部（审核时按文件自身类型匹配）
+  const sectionOptions = useMemo(() => {
+    const pool = docTypes?.length
+      ? sections.filter((s) => docTypes.includes(s.file_type_id))
+      : sections
+    const groups = new Map<string, Section[]>()
+    for (const s of pool) {
+      const ft = fileTypes.find((f) => f.id === s.file_type_id)
+      const label = ft?.name || s.file_type_id
+      const list = groups.get(label) ?? []
+      list.push(s)
+      groups.set(label, list)
+    }
+    return Array.from(groups, ([label, items]) => ({
+      label,
+      options: items.map((s) => ({
+        value: s.id,
+        label: s.name + (s.enabled === false ? '（已停用）' : ''),
+      })),
+    }))
+  }, [sections, docTypes, fileTypes])
 
   const isConsistency = category === 'consistency'
 
@@ -102,6 +144,8 @@ export default function RuleEditorModal({ open, ruleset, rule, onCancel, onSaved
       enabled: values.enabled ?? true,
       need_legal_basis: !!values.need_legal_basis,
       doc_types: (values.doc_types as string[] | undefined) || [],
+      // 关联章节：留空=不按章节裁剪（沿用全量审核）；指定后仅对命中章节的正文审核
+      section_ids: (values.section_ids as string[] | undefined) || [],
       structured,
     }
 
@@ -201,6 +245,21 @@ export default function RuleEditorModal({ open, ruleset, rule, onCancel, onSaved
             allowClear
             placeholder="全部文件（不限定）"
             options={fileTypes.map((ft) => ({ value: ft.id, label: ft.name }))}
+          />
+        </Form.Item>
+        <Form.Item
+          name="section_ids"
+          label="关联章节"
+          extra="留空则对文档全文审核；指定章节后，仅对这些章节的正文执行本规则（其余章节跳过）。若文档未命中任何关联章节，本规则不产生结论。章节在「章节库配置」中维护。"
+        >
+          <Select
+            mode="multiple"
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="不按章节裁剪（审核全文）"
+            options={sectionOptions}
+            notFoundContent="该文件类型下暂无章节，请在「章节库配置」中新增"
           />
         </Form.Item>
 

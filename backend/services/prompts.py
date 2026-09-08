@@ -92,7 +92,9 @@ def build_rule_prompt(
     # 投标审核:关注招标要求响应性
     if mode == "bid":
         tender_block = (
-            f"\n## 招标文件关键要求\n{tender_summary}\n" if tender_summary.strip() else ""
+            f"\n## 招标文件关键要求（仅作背景理解，当前规则的具体审核对象与判定标准以上文「审核规则」为准，"
+            f"不得把其中的人员要求、资格要求、业绩要求、否决投标情形等摘要标签直接作为本规则的结论）\n{tender_summary}\n"
+            if tender_summary.strip() else ""
         )
         context_note = "对每条规则核查投标文件是否符合招标要求与合规规范."
     # 招标审核:关注合规性与完备性

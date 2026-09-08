@@ -1242,6 +1242,37 @@ def _collect_typos(item: dict[str, Any], rule_id: str) -> list[dict[str, Any]]:
     return dedup
 
 
+# 招标文件摘要里常见的「关注点标签」。若模型把摘要中的这些标签直接当作某条规则的
+# 结论标题/核心内容，而当前规则说明里根本不涉及该标签，即可判定为「被招标文件摘要
+# 带偏/结论挂错规则」，降级为 unknown 并提示人工复核。
+_TENDER_LABELS = (
+    "人员要求", "资格要求", "业绩要求", "否决投标情形", "实质性",
+    "投标保证金", "投标有效期", "工期要求", "签章要求", "投标文件组成",
+    "关键时间节点", "最高限价", "预算", "项目名称", "项目编号",
+)
+
+
+def _tender_label_mismatch(item: dict[str, Any], rule: dict[str, Any]) -> str | None:
+    """检查 finding 内容是否被招标文件摘要标签带偏。
+
+    若 title/detail 中出现了 tender_summary 常见的关注点标签，但当前规则的
+    name/description/checkpoints 中完全没有该标签，说明模型把其他关注点的结论
+    写到了本规则下。返回命中的标签名，否则返回 None。
+    """
+    blob = f"{item.get('title') or ''} {item.get('detail') or ''}"
+    rule_text = " ".join(
+        [
+            rule.get("name") or "",
+            rule.get("description") or "",
+            " ".join(rule.get("checkpoints") or []),
+        ]
+    )
+    for label in _TENDER_LABELS:
+        if label in blob and label not in rule_text:
+            return label
+    return None
+
+
 def _normalize_findings(
     raw: Any,
     batch: list[dict[str, Any]],
@@ -1278,6 +1309,12 @@ def _normalize_findings(
         duplicate_unverified = False
         file_unresolved = False
         typo_entity = False
+        tender_mismatch = _tender_label_mismatch(item, rule)
+        if tender_mismatch and status in ("fail", "warn"):
+            # 模型把招标文件摘要中的关注点直接当成了本规则的结论：
+            # 例如 dec-03 打分规则下出现「人员要求不符合招标文件要求」「否决投标情形」。
+            # 这类结论与当前规则说明完全脱节，直接降级为 unknown 并提示人工复核。
+            status = "unknown"
         if status == "fail" and _explicitly_reports_no_violation(item):
             # 结语句明确「未发现/不存在 + 违规对象」却填 fail → 直接纠正为通过，
             # 并清空定位类字段（通过结论不携带原文定位，证据「无」无定位意义）。
@@ -1408,6 +1445,18 @@ def _normalize_findings(
                 "（系统纠偏：本条为错别字审查，但结论把两个不同的主体名称"
                 "（如公司名）当作正误关系，专有名词不是行文错别字，已自动判定为"
                 "「通过」。若确属名称笔误请人工在对应业务规则下复核。）"
+            ).strip()
+        if tender_mismatch:
+            # 模型被招标文件摘要带偏，把「人员要求/资格要求/否决投标情形」等
+            # 其他关注点的结论写到了当前规则下，与当前规则说明完全脱节。
+            # 降级为待人工复核，并保留原结论供人工核对。
+            base["status"] = "unknown"
+            base["tender_mismatch"] = True
+            base["detail"] = (
+                base["detail"]
+                + f"\n\n⚠️ 模型结论内容与当前规则「{rule.get('name','')}」的审核范围不一致："
+                f"出现了「{tender_mismatch}」等招标文件摘要中的关注点，而当前规则并不负责审查该项。"
+                "已自动降级为「待人工复核」，请人工核对是否应归入其他规则。"
             ).strip()
         typos = _collect_typos(item, rule_id)
         if not typos:

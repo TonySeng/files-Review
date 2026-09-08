@@ -77,6 +77,7 @@ def build_rule_prompt(
     tender_summary: str,
     extra_instruction: str = "",
     mode: str = "bid",
+    file_manifest: str = "",
 ) -> str:
     rule_lines: list[str] = []
     for idx, rule in enumerate(rules, 1):
@@ -118,6 +119,7 @@ def build_rule_prompt(
             "rules_block": rules_block,
             "extra_block": extra_block,
             "docs_text": docs_text,
+            "file_manifest": file_manifest,
             "rule_count": len(rules),
         },
     )

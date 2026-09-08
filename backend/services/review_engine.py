@@ -201,6 +201,7 @@ async def _run_rule_prompt_guarded(
     extra_instruction: str | None,
     *,
     mode: str,
+    file_manifest: str = "",
     kb_text: str,
     run_kb: bool,
     kb_id: str | None,
@@ -227,7 +228,8 @@ async def _run_rule_prompt_guarded(
     budget = int(config.get("llm_max_input_tokens", 60000))
     max_degrade = int(config.get("llm_context_overflow_max_degrade", 3))
     base_prompt = prompts.build_rule_prompt(
-        batch, docs_text, tender_summary, extra_instruction, mode=mode
+        batch, docs_text, tender_summary, extra_instruction, mode=mode,
+        file_manifest=file_manifest,
     )
     # 系统提示 + 工具 schema 的固定开销（近似），用于发前预算判断
     overhead_tokens = llm_client.estimate_tokens(prompts.system_prompt()) + 1000
@@ -255,7 +257,8 @@ async def _run_rule_prompt_guarded(
             max_chars = max(2000, int(budget * ratio / 1.5))
             text = _truncate_docs_text(text, max_chars)
             prompt = prompts.build_rule_prompt(
-                batch, text, tender_summary, extra_instruction, mode=mode
+                batch, text, tender_summary, extra_instruction, mode=mode,
+                file_manifest=file_manifest,
             )
         # 发前预算检查：未触发真实 400 即主动降级（省一次必败调用）
         if _tok(prompt, kb) > budget and level < max_degrade:
@@ -2130,6 +2133,183 @@ def _unresolved_file_reference(item: dict[str, Any], doc_names: list[str]) -> bo
     return all(not resolves(n) for n in raw)
 
 
+# --------------------------------------------------------------------------- #
+# 跨文件审查前置校验（缺件预筛）
+# --------------------------------------------------------------------------- #
+# 文档角色关键词 → 规范角色名。用于「对送审文件清单名称做预处理筛选」，确认跨文件
+# 审查所需的各文档角色均已送审，避免因缺少指定文件而臆造或做单边不完整比对。
+_DOC_ROLE_KEYWORDS: list[tuple[str, str]] = [
+    ("评审报告", "评审报告"),
+    ("评标报告", "评审报告"),
+    ("定标结果", "定标结果"),
+    ("定标审批", "定标结果"),
+    ("定标批复", "定标结果"),
+    ("中标通知书", "中标通知书"),
+    ("中标结果通知书", "中标通知书"),
+    ("招标文件", "招标文件"),
+    ("投标文件", "投标文件"),
+    ("资格证明", "资格证明"),
+    ("资质证书", "资格证明"),
+    ("营业执照", "资格证明"),
+    ("承诺书", "承诺书"),
+]
+# 规则文本中以这些措辞声明的角色视为「可选」：缺失不阻断审查（如「（如有）」）。
+_OPTIONAL_ROLE_MARKERS = ("如有", "（如有）", "(如有)", "可无", "如提供", "若提供", "可提供")
+
+
+def _infer_doc_roles(doc: dict[str, Any]) -> list[str]:
+    """从文件名/类型推断该送审文件可能对应的文档角色（用于跨文件规则缺件预筛）。"""
+    name = str(doc.get("filename") or doc.get("file_name") or "")
+    ftype = str(doc.get("file_type_name") or doc.get("file_type") or "")
+    hay = f"{name} {ftype}"
+    roles: list[str] = []
+    for kw, canon in _DOC_ROLE_KEYWORDS:
+        if kw in hay and canon not in roles:
+            roles.append(canon)
+    return roles
+
+
+def _rule_required_roles(rule: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """从规则名称/说明抽取其跨文件审查所需的文档角色。
+
+    返回 (required, optional)：required 为缺失即阻断审查的必需角色，
+    optional 为规则中以「（如有）」等措辞声明、缺失不阻断的角色。
+    """
+    text = f"{rule.get('name') or ''} {rule.get('description') or ''}"
+    found: list[str] = []
+    for kw, canon in _DOC_ROLE_KEYWORDS:
+        idx = text.find(kw)
+        if idx >= 0 and canon not in found:
+            found.append(canon)
+    optional: list[str] = []
+    for kw, canon in _DOC_ROLE_KEYWORDS:
+        idx = text.find(kw)
+        if idx < 0:
+            continue
+        # 仅取角色关键词紧邻后的少量字符判断「（如有）」等可选标记，
+        # 窗口过大会把同句中其他角色的标记误判到本角色（如「中标通知书（如有）」
+        # 的「（如有）」距前文「评审报告」仅十余字，过长窗口会误伤）。
+        window = text[idx : idx + len(kw) + 8]
+        if any(m in window for m in _OPTIONAL_ROLE_MARKERS):
+            if canon not in optional:
+                optional.append(canon)
+    required = [r for r in found if r not in optional]
+    return required, optional
+
+
+def _is_cross_file_rule(rule: dict[str, Any]) -> bool:
+    """判定规则是否涉及跨文件内容审查。"""
+    if str(rule.get("category") or "") == "consistency":
+        return True
+    text = f"{rule.get('name') or ''} {rule.get('description') or ''}"
+    return "跨文档" in text or "跨文件" in text
+
+
+def _cross_file_precheck(
+    rule: dict[str, Any], docs: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """跨文件规则缺件前置校验。
+
+    对送审文件清单名称做预处理筛选：确认规则所需的各文档角色均已送审。
+    返回 dict：
+      is_cross_file: 是否跨文件规则
+      required/optional: 必需/可选角色
+      present: 送审文件中实际命中的角色集合
+      missing: 必需但送审文件中未识别到的角色（空=齐全）
+      present_files: 命中角色的送审文件名
+      confident_missing: 是否「有把握判定缺失」（已识别到至少一个角色文件、却缺另一必需角色）
+                         ——仅此情形由后端硬性拦截，避免文件名过于泛化时误拦截。
+    """
+    is_cf = _is_cross_file_rule(rule)
+    required, optional = _rule_required_roles(rule)
+    present_roles: set[str] = set()
+    present_files: list[str] = []
+    for d in docs:
+        for role in _infer_doc_roles(d):
+            if role in required or role in optional:
+                if role not in present_roles:
+                    present_roles.add(role)
+                    present_files.append(
+                        str(d.get("filename") or d.get("file_name") or "?")
+                    )
+    required_present = [r for r in required if r in present_roles]
+    missing = [r for r in required if r not in present_roles]
+    # 是否「有把握判定缺失」并硬性拦截（避免文件名泛化时误拦截）：
+    # - 规则未声明任何必需角色（如 dec-11 仅写「各文档」）无法判定，不拦截；
+    # - 单文档内部一致性规则(必需角色仅 1 个)：仅当该角色缺失、且能识别到其他角色文件时才拦截；
+    # - 多文档跨文件规则(必需角色≥2)：仅当可比对文档数 < 2（不足以做跨文件比对）时拦截，
+    #   避免把「仅缺可选/额外来源文件」误判为无法审查（如 dec-09 缺中标通知书仍可比对报告vs定标）。
+    if not required:
+        confident_missing = False
+    elif len(required) == 1:
+        confident_missing = bool(present_roles) and not required_present
+    else:
+        confident_missing = bool(present_roles) and len(required_present) < 2
+    return {
+        "is_cross_file": is_cf,
+        "required": required,
+        "optional": optional,
+        "present": sorted(present_roles),
+        "missing": missing,
+        "present_files": present_files,
+        "confident_missing": confident_missing,
+    }
+
+
+def _make_cross_file_missing_finding(
+    rule: dict[str, Any], pc: dict[str, Any], docs: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """构造「因缺少指定文件而无法完成跨文件审查」的受控 unknown 结论。"""
+    missing = "、".join(pc["missing"])
+    present = "、".join(pc["present_files"]) or "（无匹配文件）"
+    all_files = (
+        "、".join(
+            str(d.get("filename") or d.get("file_name") or "?") for d in docs
+        )
+        or "（无）"
+    )
+    detail = (
+        f"本规则为跨文件审查，需比对以下文档角色：{ '、'.join(pc['required']) }"
+        f"（可选：{ '、'.join(pc['optional']) or '无' }）。"
+        f"经对送审文件清单名称预处理筛选，本次仅识别到：{ present }；"
+        f"缺失必需文件角色：{ missing }。因缺少指定文件，无法完成跨文件比对，"
+        f"为避免误审或产生不完整的审核结果，本规则标记为待人工复核。"
+        f"本次共送审 { len(docs) } 个文件：{ all_files }。"
+    )
+    return {
+        "rule_id": str(rule.get("id")),
+        "rule_name": rule.get("name", ""),
+        "category": rule.get("category", ""),
+        "severity": rule.get("severity", "major"),
+        "status": "unknown",
+        "title": f"无法完成跨文件审查：缺少指定文件（{missing}）",
+        "detail": detail,
+        "evidence": "",
+        "location": "",
+        "suggestion": f"请补充送审缺失文件（{ missing }）后重新审核本规则。",
+        "legal_basis": "",
+        "involved_files": [],
+        "confidence": 0.0,
+        "typo": None,
+        "cross_file_missing": True,
+    }
+
+
+def _build_file_manifest(docs: list[dict[str, Any]]) -> str:
+    """构造送审文件清单（含推断角色），供提示词注入与跨文件预筛展示。"""
+    if not docs:
+        return "（本次未送审任何文件）"
+    lines = []
+    for i, d in enumerate(docs, 1):
+        name = str(d.get("filename") or d.get("file_name") or f"文档{i}")
+        roles = _infer_doc_roles(d)
+        role_hint = (
+            f"（推断角色：{ '、'.join(roles) }）" if roles else "（未识别到明确文档角色）"
+        )
+        lines.append(f"{i}. {name} {role_hint}")
+    return "\n".join(lines)
+
+
 _ENTITY_SUFFIXES = (
     "股份有限公司", "有限责任公司", "有限公司", "集团公司", "集团", "分公司",
     "事务所", "研究院", "研究中心", "学校", "医院", "公司",
@@ -2539,6 +2719,7 @@ async def _run_rule_per_file(
     extra_instruction: str,
     mode: str,
     *,
+    file_manifest: str = "",
     kb_enabled: bool,
     kb_id: str | None,
     web_search_enabled: bool,
@@ -2572,7 +2753,8 @@ async def _run_rule_per_file(
             text = truncate(d.get("text") or "", limit)
             file_text = f"【文件：{fname}】\n{text}"
             prompt = prompts.build_rule_prompt(
-                batch, file_text, tender_summary, extra_instruction, mode=mode
+                batch, file_text, tender_summary, extra_instruction, mode=mode,
+                file_manifest=file_manifest,
             )
             if batch_kb_context:
                 prompt = (
@@ -2624,6 +2806,7 @@ async def _proofread_by_segments(
     extra_instruction: str,
     mode: str,
     emit: Any,
+    file_manifest: str = "",
     batch_kb_context: str = "",
     batch_index: int = 0,
     total_batches: int = 1,
@@ -2664,7 +2847,8 @@ async def _proofread_by_segments(
 
     async def run_seg(idx: int, seg: str):
         seg_prompt = prompts.build_rule_prompt(
-            batch, seg, tender_summary, extra_instruction, mode=mode
+            batch, seg, tender_summary, extra_instruction, mode=mode,
+            file_manifest=file_manifest,
         )
         seg_prompt = (
             f"【分段校对 {idx}/{total_seg}】以下为待审文档的第 {idx}/{total_seg} 段原文，"
@@ -2948,6 +3132,27 @@ async def run_review(
                         batch, structured_findings
                     )
 
+                    # 跨文件规则缺件前置校验：对送审文件清单名称做预处理筛选，
+                    # 必需文档角色缺失且可判定时，直接给出受控 unknown 并排除出 LLM 批次，
+                    # 避免模型臆造或做单边不完整比对（如 dec-09 缺定标结果时误判名称一致）。
+                    file_manifest = _build_file_manifest(docs)
+                    _cf_intercepted: list[tuple[dict[str, Any], dict[str, Any]]] = []
+                    _cf_keep: list[dict[str, Any]] = []
+                    for _r in llm_rules:
+                        _pc = _cross_file_precheck(_r, docs)
+                        if _pc["is_cross_file"] and _pc["confident_missing"]:
+                            _cf_intercepted.append((_r, _pc))
+                        else:
+                            _cf_keep.append(_r)
+                    if _cf_intercepted:
+                        for _r, _pc in _cf_intercepted:
+                            locked_findings.append(
+                                _make_cross_file_missing_finding(_r, _pc, docs)
+                            )
+                        llm_rules = _cf_keep
+                        _intercept_ids = {r[0].get("id") for r in _cf_intercepted}
+                        batch = [r for r in batch if r.get("id") not in _intercept_ids]
+
                     # 按规则关联文档类型过滤适用文档：规则限定了 doc_types 时，
                     # 仅对匹配文件类型的文件执行本规则审核（其他文件不执行该规则）。
                     # 一批次含多规则时取 doc_types 并集；若无任何文件匹配，则跳过该批次
@@ -3085,9 +3290,9 @@ async def run_review(
                     )
                     if segmented:
                         try:
-                            raw, traces = await _proofread_by_segments(
-                                batch,
-                                batch_docs_text,
+                                raw, traces = await _proofread_by_segments(
+                                    batch,
+                                    batch_docs_text,
                                 tender_summary,
                                 extra_instruction,
                                 mode=mode,
@@ -3105,6 +3310,7 @@ async def run_review(
                                 cache_prefix=cache_prefix,
                                 temperature=det_temperature,
                                 kb_state=kb_state,
+                                file_manifest=file_manifest,
                             )
                         except llm_client.LLMError as exc:
                             logger.error("规则批次审核失败: %s", exc)
@@ -3117,6 +3323,7 @@ async def run_review(
                             try:
                                 raw, traces = await _run_rule_per_file(
                                     batch, batch_docs, tender_summary, extra_instruction,
+                                    file_manifest=file_manifest,
                                     mode=mode,
                                     kb_enabled=run_kb, kb_id=kb_id,
                                     web_search_enabled=web_search_enabled,
@@ -3159,6 +3366,7 @@ async def run_review(
                                     batch_docs_text,
                                     tender_summary,
                                     extra_instruction,
+                                    file_manifest=file_manifest,
                                     mode=mode,
                                     kb_text=batch_kb_context,
                                     run_kb=run_kb,
@@ -3385,6 +3593,19 @@ async def run_review(
                 # 按一致性类规则的关联文档类型过滤参与核查的文件：规则限定了
                 # doc_types 时仅对这些文件类型做一致性比对；均未限定时沿用全部文件。
                 _cons_rules = [r for r in rules if rules_store.is_consistency_rule(r)]
+                # 跨文件一致性规则缺件前置校验：必需文档角色缺失且可判定时，
+                # 跳过该规则的一致性比对，直接给出受控 unknown，避免单边不完整比对。
+                _cons_intercepted: list[tuple[dict[str, Any], dict[str, Any]]] = []
+                _cons_active: list[dict[str, Any]] = []
+                for _cr in _cons_rules:
+                    _pc = _cross_file_precheck(_cr, docs)
+                    if _pc["is_cross_file"] and _pc["confident_missing"]:
+                        _cons_intercepted.append((_cr, _pc))
+                    else:
+                        _cons_active.append(_cr)
+                for _cr, _pc in _cons_intercepted:
+                    findings.append(_make_cross_file_missing_finding(_cr, _pc, docs))
+                _cons_rules = _cons_active
                 _cons_types: set[str] = set()
                 for _cr in _cons_rules:
                     for _dt in (_cr.get("doc_types") or []):

@@ -59,7 +59,7 @@ async def parse_document_headings(
     caller: dict = Depends(deps.get_caller),
 ):
     """返回该文档正文被识别为章节标题的行，供配置章节时快速录入同义词。"""
-    rec = file_store.get(file_id)
+    rec = file_store.get(file_id, deps.scope_user_id(caller))
     if not rec:
         raise HTTPException(status_code=404, detail="文件不存在或已被清理")
     headings = sec_store.parse_headings(rec.get("text") or "")
@@ -81,7 +81,7 @@ async def preview_sections(payload: dict, caller: dict = Depends(deps.get_caller
     file_id = str(payload.get("file_id") or "")
     if not file_id:
         raise HTTPException(status_code=400, detail="file_id 不能为空")
-    rec = file_store.get(file_id)
+    rec = file_store.get(file_id, deps.scope_user_id(caller))
     if not rec:
         raise HTTPException(status_code=404, detail="文件不存在或已被清理")
 

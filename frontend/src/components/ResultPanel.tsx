@@ -399,8 +399,18 @@ export default function ResultPanel({
           <Typography.Text strong={row.status === 'fail'} style={{ fontSize: 13 }}>
             {title || '（无结论）'}
           </Typography.Text>
+          {/* 折叠后的推理过程含换行（【结论】/【核查范围】/【问题明细】分段），
+              必须按原文换行渲染，否则挤成一团不可读 */}
           {row.detail && (
-            <Typography.Text type="secondary" style={{ fontSize: 12.5, lineHeight: 1.75 }}>
+            <Typography.Text
+              type="secondary"
+              style={{
+                fontSize: 12.5,
+                lineHeight: 1.75,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+              }}
+            >
               {row.detail}
             </Typography.Text>
           )}
@@ -664,7 +674,9 @@ export default function ResultPanel({
                                             strong={fd.status === 'fail'}
                                             style={{ fontSize: 13 }}
                                           >
-                                            {fd.title || '（无结论）'}
+                                            {/* 历史任务可能存在空标题：按状态回落到
+                                                「状态：规则名」，保证标题与状态口径一致 */}
+                                            {fd.title || `（${STATUS_META[fd.status].label}）`}
                                           </Typography.Text>
                                         </Space>
                                         {fd.detail && (
@@ -819,6 +831,80 @@ export default function ResultPanel({
                 dataSource={filtered}
                 pagination={false}
                 loading={running && !findings.length}
+                expandable={{
+                  // 结论已按「规则维度」折叠（每规则一条），展开查看该规则下
+                  // 各送审文件的逐条明细；无 file_results 的历史任务不提供展开。
+                  rowExpandable: (r) => (r.file_results || []).length > 0,
+                  expandedRowRender: (r) => {
+                    const files = r.file_results || []
+                    if (!files.length) return null
+                    return (
+                      <Collapse
+                        size="small"
+                        items={files.map((fr, i) => ({
+                          key: String(i),
+                          label: (
+                            <Space size={8} wrap>
+                              <Tag
+                                color={STATUS_META[fr.status].color}
+                                icon={STATUS_META[fr.status].icon}
+                                style={{ marginRight: 0 }}
+                              >
+                                {STATUS_META[fr.status].label}
+                              </Tag>
+                              <span style={{ fontSize: 13 }}>{fr.file}</span>
+                              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                {fr.issue_count > 0 ? `${fr.issue_count} 条问题` : '无问题'}
+                              </Typography.Text>
+                            </Space>
+                          ),
+                          children: (
+                            <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                              {fr.findings.map((fd, j) => (
+                                <div key={j}>
+                                  <Space size={6} wrap>
+                                    <Tag
+                                      color={STATUS_META[fd.status].color}
+                                      icon={STATUS_META[fd.status].icon}
+                                      style={{ marginRight: 0 }}
+                                    >
+                                      {STATUS_META[fd.status].label}
+                                    </Tag>
+                                    <Typography.Text
+                                      strong={fd.status === 'fail'}
+                                      style={{ fontSize: 13 }}
+                                    >
+                                      {fd.title || `（${STATUS_META[fd.status].label}）`}
+                                    </Typography.Text>
+                                  </Space>
+                                  {fd.detail && (
+                                    <Typography.Text
+                                      type="secondary"
+                                      style={{
+                                        fontSize: 12.5,
+                                        display: 'block',
+                                        lineHeight: 1.75,
+                                        whiteSpace: 'pre-wrap',
+                                        marginTop: 2,
+                                      }}
+                                    >
+                                      {fd.detail}
+                                    </Typography.Text>
+                                  )}
+                                  {fd.evidence && (
+                                    <div className="evidence-block" style={{ marginTop: 4 }}>
+                                      {fd.evidence}
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </Space>
+                          ),
+                        }))}
+                      />
+                    )
+                  },
+                }}
               />
             ),
           },

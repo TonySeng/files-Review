@@ -362,6 +362,12 @@ class ConfigUpdate(BaseModel):
     llm_max_input_tokens: int | None = None  # 发前 token 预算上限：估算超此值即触发多级降级
     llm_context_overflow_max_degrade: int | None = None  # 上下文超长最大降级次数（0=关闭降级）
     rules_per_batch: int | None = None  # 每批送审规则数（方案C：6 → 10）
+    # 多文件按「文件」切片并行（不加入白名单会被 PATCH 静默丢弃）
+    rule_per_file_enabled: bool | None = None
+    rule_per_file_concurrent: int | None = None
+    # 结论按「规则维度」收口 + 规则关联文档类型的文件名自动匹配（2026-09-09 新增）
+    conclusion_per_rule_enabled: bool | None = None
+    rule_doc_auto_match: bool | None = None
     findings_cache_enabled: bool | None = None  # 方案C：相同输入批次复用历史结论、跳过 LLM 调用的全局开关
     consistency_cache_enabled: bool | None = None  # 一致性切片摘要缓存开关（提效①）
     consistency_max_concurrent: int | None = None  # 一致性阶段并发上限（提效②，默认串行）
@@ -409,6 +415,8 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     token: str  # 管理员会话令牌（X-Session-Token）
     user: "UserOut"
+    # 安全提示：登录账号是否仍在使用出厂默认管理员密码（前端据此强制/引导改密）。
+    must_change_password: bool = False
 
 
 class UserCreate(BaseModel):

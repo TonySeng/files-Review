@@ -5,10 +5,11 @@ import logging
 from datetime import datetime
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+from ..routers import deps
 from ..services import report_exporter
 
 logger = logging.getLogger(__name__)
@@ -27,8 +28,8 @@ class ExportRequest(BaseModel):
 
 
 @router.post("/report", summary="导出审核报告（docx/pdf），返回文件流")
-async def export_report(req: ExportRequest):
-    """导出审核报告为 Word 或 PDF。"""
+async def export_report(req: ExportRequest, _: dict = Depends(deps.get_caller)):
+    """导出审核报告为 Word 或 PDF。需登录。"""
     if req.format not in ["word", "pdf"]:
         raise HTTPException(status_code=400, detail="格式必须是 'word' 或 'pdf'")
 

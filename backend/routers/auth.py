@@ -15,7 +15,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+import time as _time
+from collections import deque
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+
+from .. import config
 
 from ..models.schemas import (
     LoginRequest,
@@ -39,10 +44,42 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 # 在进程启动时播种默认管理员（如尚不存在）
 users_store._seed_default_admin()
 
+# 自助注册防刷：按客户端 IP 记录近期注册时间戳，滑动窗口内超限即 429。
+# 纯进程内、无外部依赖；多实例部署时各实例独立计数（够用；真正强限流应在网关层做）。
+_REG_WINDOW_SECS = 3600
+_REG_MAX_PER_WINDOW = 5
+_reg_hits: dict[str, deque[float]] = {}
+
+
+def _register_rate_limit(client_ip: str) -> None:
+    now = _time.time()
+    dq = _reg_hits.setdefault(client_ip, deque())
+    while dq and now - dq[0] > _REG_WINDOW_SECS:
+        dq.popleft()
+    if len(dq) >= _REG_MAX_PER_WINDOW:
+        raise HTTPException(
+            status_code=429,
+            detail="注册过于频繁，请稍后再试（同一来源每小时最多注册 5 次）",
+        )
+    dq.append(now)
+    # 轻量清理：字典无界增长防护（IP 数超阈值时清掉已空队列）
+    if len(_reg_hits) > 4096:
+        for k in [k for k, v in _reg_hits.items() if not v]:
+            _reg_hits.pop(k, None)
+
 
 @router.post("/register", summary="用户自助注册（创建待审核账号）", response_model=UserOut)
-async def register(payload: RegisterRequest):
-    """普通用户自助注册：创建 pending 用户，待管理员审批后方可登录。"""
+async def register(payload: RegisterRequest, request: Request):
+    """普通用户自助注册：创建 pending 用户，待管理员审批后方可登录。
+
+    受两道闸控制：
+    - allow_self_register=False 时全局关闭自助注册（内网场景常只由管理员建号）；
+    - 同一来源 IP 滑动窗口限流，防止批量刷号写放大。
+    """
+    if not bool(config.get("allow_self_register", True)):
+        raise HTTPException(status_code=403, detail="系统已关闭自助注册，请联系管理员开通账号")
+    client_ip = request.client.host if request.client else "unknown"
+    _register_rate_limit(client_ip)
     try:
         u = users_store.register_user(
             payload.username, payload.password, payload.display_name
@@ -70,7 +107,15 @@ async def login(payload: LoginRequest):
         user_id=u["id"], username=u["username"], role=u["role"]
     )
     users_store.record_login(u["id"])
-    return LoginResponse(token=token, user=users_store.to_public(u, include_api_key=False))
+    # 出厂默认管理员密码仍在使用时，提示前端强制/引导改密（仅对该默认 admin 账号为真）
+    must_change = (
+        u.get("role") == "admin" and users_store.default_admin_password_in_use()
+    )
+    return LoginResponse(
+        token=token,
+        user=users_store.to_public(u, include_api_key=False),
+        must_change_password=must_change,
+    )
 
 
 @router.post("/logout", summary="退出登录并使会话令牌失效")

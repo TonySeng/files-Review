@@ -171,6 +171,19 @@ def get_by_id(uid: str) -> dict[str, Any] | None:
     return _migrate(u) if u else None
 
 
+def default_admin_password_in_use() -> bool:
+    """检测是否仍在使用出厂默认管理员密码（用于登录后强制改密提示/门禁）。
+
+    仅当存在用户名为 DEFAULT_ADMIN_USER 的 admin 账号，且其密码校验为
+    DEFAULT_ADMIN_PASS 时返回 True。上线前若已改密或停用默认账号即返回 False。
+    """
+    u = get_by_username(DEFAULT_ADMIN_USER)
+    if not u or u.get("role") != "admin":
+        return False
+    stored = u.get("password_hash")
+    return bool(stored and _verify_password(DEFAULT_ADMIN_PASS, stored))
+
+
 def get_by_username(username: str) -> dict[str, Any] | None:
     un = (username or "").strip()
     for u in _load().values():

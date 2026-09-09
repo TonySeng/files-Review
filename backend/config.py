@@ -42,6 +42,8 @@ DEFAULTS: dict[str, Any] = {
     "rules_per_batch": 1,  # 按规则逐条送审：每条规则一次独立 LLM 调用，并行受 concurrency 控制；失败隔离、单请求体量更小
     "rule_per_file_enabled": True,  # 多文件非编辑类规则：按"文件"切片并行（同源分段思路），消除 N×60k 巨型 prompt 撞 540s 硬顶
     "rule_per_file_concurrent": 6,  # 单批次内"按文件并行"的并发上限（受全局 llm_max_concurrent 二次收口）
+    "conclusion_per_rule_enabled": True,  # 结论按「规则维度」收口：同一规则在多文件/多段产生的多条结论折叠为一条（明细保留在 file_results 供下钻）；关闭则维持逐条结论的旧行为
+    "rule_doc_auto_match": True,  # 规则关联文档类型(doc_types)除 file_type 精确匹配外，额外用送审文件「名称」自动匹配（类型名/同义角色关键词），避免未手动指定类型时匹配不到文件
     "findings_cache_enabled": True,  # 方案C：相同输入批次复用历史结论，跳过 LLM 调用
     "kb_prefetch_global": True,  # 按规则按需预检索知识库：仅 need_legal_basis 的规则检索，依据只注入该规则 prompt，避免全量 KB 灌入每个请求
     # OCR（支持三种服务：tuling=图聆云 免鉴权 multipart 上传；baidu=百度智能云 OCR，AK/SK 换 access_token；
@@ -156,6 +158,10 @@ DEFAULTS: dict[str, Any] = {
     # 是否把「当前系统时间」作为判定依据（强烈建议 False）。
     # 审核结论必须仅依赖文档内容与规则，不依赖运行时刻。
     "use_current_time_as_basis": False,
+    # ---- 账号与安全 ----
+    # 是否允许用户自助注册（POST /api/auth/register）。内网部署常只由管理员建号，
+    # 可置 False 全局关闭自助注册入口（仍受来源 IP 限流二次保护）。
+    "allow_self_register": True,
 }
 
 _lock = threading.Lock()

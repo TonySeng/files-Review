@@ -71,8 +71,19 @@ def _safe_name(name: str) -> str:
     return name[:180] or "unnamed"
 
 
+def _owner_ok(record: dict[str, Any] | None, scope_user_id: str | None) -> bool:
+    """归属校验：scope_user_id 为 None 表示管理员/内部调用（不过滤）；
+    否则仅当记录归属为空（历史/系统级）或等于该用户时放行。"""
+    if record is None:
+        return False
+    if scope_user_id is None:
+        return True
+    return record.get("owner_id") in (None, scope_user_id)
+
+
 async def save_and_parse(
-    filename: str, content: bytes, role: str = "bid", file_type: str | None = None
+    filename: str, content: bytes, role: str = "bid", file_type: str | None = None,
+    owner_id: str | None = None,
 ) -> dict[str, Any]:
     if len(content) > MAX_FILE_SIZE:
         raise StoreError(f"文件超过 {MAX_FILE_SIZE // 1024 // 1024}MB 大小限制")
@@ -110,6 +121,9 @@ async def save_and_parse(
         # role=legal：法规依据文件，仅用于生成临时规则，不参与审核（review 侧会拦截）
         "role": role if role in ("tender", "bid", "attachment", "legal") else "bid",
         "file_type": file_type,
+        # 归属用户：普通用户上传记本人 user_id；管理员/系统级为 None（全局可见）。
+        # 文件读/写/删按此字段做作用域隔离，防止跨用户越权访问送审原文。
+        "owner_id": owner_id,
         "path": str(dest),
         "text": "",
         "char_count": 0,
@@ -176,42 +190,47 @@ def _role_for_file_type(file_type: str | None) -> str:
     return "attachment"
 
 
-def get(file_id: str) -> dict[str, Any] | None:
+def get(file_id: str, scope_user_id: str | None = None) -> dict[str, Any] | None:
+    """按 id 取文件记录。scope_user_id 非 None 时做归属校验，越权返回 None。"""
     with _lock:
-        return _files.get(file_id)
+        record = _files.get(file_id)
+    return record if _owner_ok(record, scope_user_id) else None
 
 
-def get_many(file_ids: list[str]) -> list[dict[str, Any]]:
+def get_many(file_ids: list[str], scope_user_id: str | None = None) -> list[dict[str, Any]]:
     with _lock:
         found = [_files[f] for f in file_ids if f in _files]
+    # 归属校验：越权文件视同不存在（避免泄露他人文件的存在性）
+    found = [f for f in found if _owner_ok(f, scope_user_id)]
     missing = set(file_ids) - {f["file_id"] for f in found}
     if missing:
         raise StoreError(f"文件不存在或已过期: {', '.join(sorted(missing))}")
     return found
 
 
-def list_files() -> list[dict[str, Any]]:
+def list_files(scope_user_id: str | None = None) -> list[dict[str, Any]]:
     with _lock:
-        return [_public(f) for f in _files.values()]
+        vals = list(_files.values())
+    return [_public(f) for f in vals if _owner_ok(f, scope_user_id)]
 
 
-def set_role(file_id: str, role: str) -> dict[str, Any]:
+def set_role(file_id: str, role: str, scope_user_id: str | None = None) -> dict[str, Any]:
     if role not in ("tender", "bid", "attachment", "legal"):
         raise StoreError(f"非法的文件角色: {role}")
     with _lock:
         record = _files.get(file_id)
-        if not record:
+        if not record or not _owner_ok(record, scope_user_id):
             raise StoreError("文件不存在")
         record["role"] = role
         _save_files()
         return _public(record)
 
 
-def set_file_type(file_id: str, file_type: str | None) -> dict[str, Any]:
+def set_file_type(file_id: str, file_type: str | None, scope_user_id: str | None = None) -> dict[str, Any]:
     """手动指定文件类型（系统不自动识别）；同步派生引擎角色。"""
     with _lock:
         record = _files.get(file_id)
-        if not record:
+        if not record or not _owner_ok(record, scope_user_id):
             raise StoreError("文件不存在")
         # 校验类型是否存在且后缀匹配
         ft_record = file_types.get(file_type) if file_type else None
@@ -236,20 +255,21 @@ def set_file_type(file_id: str, file_type: str | None) -> dict[str, Any]:
         return _public(record)
 
 
-def delete(file_id: str) -> bool:
+def delete(file_id: str, scope_user_id: str | None = None) -> bool:
     with _lock:
-        record = _files.pop(file_id, None)
-    if not record:
-        return False
+        record = _files.get(file_id)
+        if not record or not _owner_ok(record, scope_user_id):
+            return False
+        _files.pop(file_id, None)
     Path(record["path"]).unlink(missing_ok=True)
     _save_files()
     return True
 
 
 def _public(record: dict[str, Any]) -> dict[str, Any]:
-    """不外传全文、章节体与本地路径（section_count 保留供前端展示）。"""
+    """不外传全文、章节体、本地路径与归属用户（section_count 保留供前端展示）。"""
     return {
         k: v
         for k, v in record.items()
-        if k not in ("text", "path", "sections")
+        if k not in ("text", "path", "sections", "owner_id")
     }

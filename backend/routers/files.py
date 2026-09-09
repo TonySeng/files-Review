@@ -45,6 +45,7 @@ async def upload(
     role_list = [r.strip() for r in roles.split(",") if r.strip()]
     type_list = [t.strip() for t in file_types.split(",") if t.strip()]
     results, errors = [], []
+    owner_id = caller.get("user_id")
 
     async def handle(idx: int, upload_file: UploadFile):
         role = role_list[idx] if idx < len(role_list) else "bid"
@@ -52,7 +53,8 @@ async def upload(
         try:
             content = await upload_file.read()
             record = await file_store.save_and_parse(
-                upload_file.filename or "unnamed", content, role, ftype
+                upload_file.filename or "unnamed", content, role, ftype,
+                owner_id=owner_id,
             )
             results.append(file_store._public(record))
         except file_store.StoreError as exc:
@@ -70,13 +72,13 @@ async def upload(
 
 @router.get("", summary="查询当前会话已上传文件列表")
 async def list_files(caller: dict = Depends(deps.get_caller)):
-    return {"files": file_store.list_files()}
+    return {"files": file_store.list_files(deps.scope_user_id(caller))}
 
 
 @router.patch("/{file_id}/role", summary="修改文件角色（招标/投标/附件）")
 async def update_role(file_id: str, payload: dict, caller: dict = Depends(deps.get_caller)):
     try:
-        return file_store.set_role(file_id, payload.get("role", ""))
+        return file_store.set_role(file_id, payload.get("role", ""), deps.scope_user_id(caller))
     except file_store.StoreError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -87,7 +89,9 @@ async def update_type(
 ):
     """手动指定文件类型（系统不自动识别）。返回更新后的文件元信息。"""
     try:
-        return file_store.set_file_type(file_id, payload.get("file_type") or None)
+        return file_store.set_file_type(
+            file_id, payload.get("file_type") or None, deps.scope_user_id(caller)
+        )
     except file_store.StoreError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -111,15 +115,16 @@ async def locate_snippet(
             "message": "定位锚点过短（少于 4 字），已拒绝检索以避免错误定位",
         }
 
+    scope = deps.scope_user_id(caller)
     if req.file_ids:
         try:
-            docs = file_store.get_many(req.file_ids)
+            docs = file_store.get_many(req.file_ids, scope)
         except file_store.StoreError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
     else:
-        # 未指定文件时在全部已上传文件中查找
+        # 未指定文件时在当前用户可见的已上传文件中查找
         docs = [
-            d for d in (file_store.get(f["file_id"]) for f in file_store.list_files())
+            d for d in (file_store.get(f["file_id"], scope) for f in file_store.list_files(scope))
             if d is not None
         ]
 
@@ -152,7 +157,7 @@ async def preview_page(
 
     无页标记的文档（docx/txt/xlsx）视为单页「全文」。
     """
-    record = file_store.get(file_id)
+    record = file_store.get(file_id, deps.scope_user_id(caller))
     if not record:
         raise HTTPException(status_code=404, detail="文件不存在")
     text = record.get("text") or ""
@@ -217,7 +222,7 @@ async def preview_page(
 
 @router.get("/{file_id}/text", summary="获取文件提取后的纯文本内容")
 async def get_text(file_id: str, limit: int = 20000, caller: dict = Depends(deps.get_caller)):
-    record = file_store.get(file_id)
+    record = file_store.get(file_id, deps.scope_user_id(caller))
     if not record:
         raise HTTPException(status_code=404, detail="文件不存在")
     text = record.get("text") or ""
@@ -240,7 +245,7 @@ async def get_sections(file_id: str, caller: dict = Depends(deps.get_caller)):
     source（style=Word 样式标题 / worksheet=Excel 工作表 / regex=正则识别 /
     preamble=前置内容）。审核引擎按规则关联章节直接复用该结构做精确送审。
     """
-    record = file_store.get(file_id)
+    record = file_store.get(file_id, deps.scope_user_id(caller))
     if not record:
         raise HTTPException(status_code=404, detail="文件不存在")
     sections = record.get("sections") or []
@@ -271,7 +276,7 @@ async def get_sections(file_id: str, caller: dict = Depends(deps.get_caller)):
 
 @router.delete("/{file_id}", summary="删除已上传文件")
 async def delete_file(file_id: str, caller: dict = Depends(deps.get_caller)):
-    if not file_store.delete(file_id):
+    if not file_store.delete(file_id, deps.scope_user_id(caller)):
         raise HTTPException(status_code=404, detail="文件不存在")
     return {"deleted": True}
 
@@ -283,7 +288,7 @@ async def download_file(file_id: str, caller: dict = Depends(deps.get_caller)):
     文件字节持久化在数据卷 uploads 子目录，容器重启不会丢失；若记录存在但
     磁盘字节已缺失（极端情况），返回 404 提示不可用而非抛出。
     """
-    record = file_store.get(file_id)
+    record = file_store.get(file_id, deps.scope_user_id(caller))
     if not record:
         raise HTTPException(status_code=404, detail="文件不存在")
     path = record.get("path")

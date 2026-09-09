@@ -13,8 +13,14 @@ from . import prompt_store
 SYSTEM = prompt_store.BUILTIN_PROMPTS["review_system"]["content"]
 
 
-def system_prompt() -> str:
-    """审核 system 提示词（当前生效版本，支持后台自定义）。"""
+def system_prompt(mode: str = "bid") -> str:
+    """审核 system 提示词（当前生效版本，支持后台自定义）。
+
+    mode=general 走「通用文档审核」system 提示词（不预设招投标背景，适用于
+    合同/方案/报告/制度等各类文档）；bid/tender 沿用招投标合规审核提示词。
+    """
+    if mode == "general":
+        return prompt_store.render("review_system_general")
     return prompt_store.render("review_system")
 
 TOOLS: list[dict[str, Any]] = [

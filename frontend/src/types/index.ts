@@ -265,6 +265,10 @@ export interface Finding {
   locations?: FindingLocation[]
   confidence: number
   typo?: TypoInfo | null
+  /** 结论按「规则维度」折叠后：该规则下非 pass 结论的条数 */
+  issue_count?: number
+  /** 结论按「规则维度」折叠后：该规则下按文件归组的逐条明细（供展开下钻） */
+  file_results?: RuleFileResult[]
 }
 
 export type FeedbackJudgment = 'adopt' | 'reject'

@@ -86,6 +86,7 @@ async def import_rules(
     file: UploadFile,
     ruleset_name: str | None = Form(None),
     append_to: str | None = Form(None),
+    byfile: str | None = Form(None),
     caller: dict = Depends(deps.get_caller),
 ):
     """批量导入规则：解析 CSV/XLSX/XLS，写入（或追加到）自定义规则集。
@@ -141,14 +142,13 @@ async def import_rules(
         detail = "没有可导入的有效规则：" + "；".join(errors[:5])
         raise HTTPException(status_code=400, detail=detail)
 
-    # 分组：若行内含「规则集名称」列则按名称分组建集（导出文件回导场景），
-    # 否则沿用原有单集逻辑（尊重 append_to / ruleset_name 表单参数）。
-    from collections import defaultdict
-
-    grouped: dict[str | None, list[dict[str, Any]]] = defaultdict(list)
-    for r in rules:
-        gname = (r.get("ruleset_name") or "").strip() or None
-        grouped[gname].append(r)
+    # 分组：表单里的选择优先于文件内「规则集名称」列（详见 group_rules_for_import 说明）。
+    # 仅当用户显式选择 byfile 且未指定 append_to/ruleset_name 时，才按行内列多集分组
+    # （用于“导出→回导”多集场景）；否则忽略该列，统一走新建/追加逻辑。
+    _plan = rule_import.group_rules_for_import(
+        rules, ruleset_name=ruleset_name, append_to=append_to, byfile=byfile
+    )
+    grouped = _plan["grouped"]
 
     if len(grouped) == 1 and None in grouped:
         # —— 旧式单集导入（与改造前完全一致）——

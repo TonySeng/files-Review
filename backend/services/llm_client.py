@@ -33,14 +33,20 @@ class LLMContextOverflow(LLMError):
 
 # 全局并发闸：限制同时打到 LLM 提供方的在途请求数，避免「批次并发」放大触发限流(429/503)雪崩。
 # 与审核引擎的批次并发解耦——批次可多路在飞计算 prompt，但落库到提供方的请求受此闸约束。
+#
+# 热更新（修复：旧实现首次调用即缓存 cap，运行时改 llm_max_concurrent 不生效需重启）：
+# 记录构造时的 cap，每次取用时对比当前配置；变化即重建 semaphore。重建只影响「之后」
+# 获取闸门的请求，已在闸内的在途请求自然排空，不会中断。收紧并发在少量在途请求跑完后即达成。
 _LLM_SEM: asyncio.Semaphore | None = None
+_LLM_SEM_CAP: int = 0
 
 
 def _llm_semaphore() -> asyncio.Semaphore:
-    global _LLM_SEM
-    if _LLM_SEM is None:
-        cap = int(config.get("llm_max_concurrent", 3))
-        _LLM_SEM = asyncio.Semaphore(max(1, cap))
+    global _LLM_SEM, _LLM_SEM_CAP
+    cap = max(1, int(config.get("llm_max_concurrent", 3)))
+    if _LLM_SEM is None or cap != _LLM_SEM_CAP:
+        _LLM_SEM = asyncio.Semaphore(cap)
+        _LLM_SEM_CAP = cap
     return _LLM_SEM
 
 
@@ -91,6 +97,14 @@ def _is_context_overflow(body: str) -> bool:
     return any(k in b for k in _CONTEXT_OVERFLOW_KEYS)
 
 
+# CJK 字符区间（基本汉字 / 扩展A / 兼容汉字 / CJK 标点+日文假名 / 韩文音节 / 扩展B+）。
+# 用于 estimate_tokens 的快速 CJK 计数。
+_CJK_RE = re.compile(
+    "[　-ヿ㐀-䶿一-鿿豈-﫿가-힯"
+    "\U00020000-\U0002ffff]"
+)
+
+
 def estimate_tokens(text: str) -> int:
     """近似 token 计数（不依赖 tiktoken，避免引入重依赖）。
 
@@ -100,21 +114,10 @@ def estimate_tokens(text: str) -> int:
     """
     if not text:
         return 0
-    cjk = 0
-    other = 0
-    for ch in text:
-        o = ord(ch)
-        if (
-            0x3000 <= o <= 0x30FF          # CJK 标点 + 日文假名
-            or 0x3400 <= o <= 0x4DBF       # 扩展 A
-            or 0x4E00 <= o <= 0x9FFF       # 基本汉字
-            or 0xF900 <= o <= 0xFAFF       # 兼容汉字
-            or 0xAC00 <= o <= 0xD7AF       # 韩文音节
-            or 0x20000 <= o <= 0x2FFFF     # 扩展 B+（生僻字）
-        ):
-            cjk += 1
-        else:
-            other += 1
+    # 用正则一次性统计 CJK 字符数（C 层实现，远快于逐字符 Python 循环——
+    # 高并发下逐字符遍历 6 万字 × 多文件会明显占用事件循环 CPU）。
+    cjk = len(_CJK_RE.findall(text))
+    other = len(text) - cjk
     return int(cjk * 1.6 + other * 0.3) + 1
 
 
@@ -429,10 +432,72 @@ async def chat_stream(
 
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
+# 尾随逗号：, 后仅跟空白与闭合括号（JSON 不允许，但小参数模型高频产出）
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+def _strip_trailing_commas(s: str) -> str:
+    """移除对象/数组里的尾随逗号（"a":1,} → "a":1}）。反复替换以处理嵌套连续场景。"""
+    prev = None
+    while prev != s:
+        prev = s
+        s = _TRAILING_COMMA_RE.sub(r"\1", s)
+    return s
+
+
+def _complete_truncated(s: str) -> str | None:
+    """对被截断的 JSON 做最小闭合修复：按栈补齐未闭合的字符串与括号。
+
+    小参数模型在 max_tokens 截断时常输出「半截 JSON」（未闭合的字符串/数组/对象），
+    直接解析必失败、整批结论作废。此处在扫描到文本结束仍有未闭合结构时，按栈顺序
+    补上 "、}、]，尽量抢救出已生成的完整前缀（尾部残缺的最后一项由后续 json.loads
+    容错或调用方按 rule_id 缺失补答处理）。返回补齐后的字符串；无可修复结构返回 None。
+    """
+    start = min(
+        [p for p in (s.find("{"), s.find("[")) if p >= 0],
+        default=-1,
+    )
+    if start < 0:
+        return None
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    # 记录最后一个「结构上安全」的截断点（不在字符串中、且刚闭合完一项）用于兜底
+    for ch in s[start:]:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+    repaired = s[start:]
+    if in_str:
+        repaired += '"'
+    # 去掉可能悬空的尾随逗号后再补闭合括号
+    repaired = _strip_trailing_commas(repaired.rstrip().rstrip(","))
+    while stack:
+        repaired += stack.pop()
+    return repaired
 
 
 def parse_json(text: str) -> Any:
-    """从模型输出中稳健提取 JSON：优先代码块，其次首个平衡括号片段。"""
+    """从模型输出中稳健提取 JSON：优先代码块，其次首个平衡括号片段。
+
+    容错分级（由严到宽，well-formed JSON 走第一档零开销）：
+    1) 直接 json.loads；
+    2) 括号平衡扫描，容忍前后多余说明文字；
+    3) 去尾随逗号后重试（小参数模型高频缺陷）；
+    4) 截断补齐：对未闭合的字符串/括号做最小闭合，抢救半截 JSON。
+    """
     if not text:
         raise LLMError("模型输出为空")
     candidates: list[str] = []
@@ -440,12 +505,21 @@ def parse_json(text: str) -> Any:
         candidates.append(m.group(1).strip())
     candidates.append(text.strip())
 
-    for cand in candidates:
+    def _try(s: str) -> tuple[bool, Any]:
         try:
-            return json.loads(cand)
+            return True, json.loads(s)
         except json.JSONDecodeError:
-            pass
-        # 括号平衡扫描，容忍前后多余说明文字
+            return False, None
+
+    for cand in candidates:
+        ok, val = _try(cand)
+        if ok:
+            return val
+        # 3) 去尾随逗号后整体重试
+        ok, val = _try(_strip_trailing_commas(cand))
+        if ok:
+            return val
+        # 2) 括号平衡扫描，容忍前后多余说明文字
         for opener, closer in (("{", "}"), ("[", "]")):
             start = cand.find(opener)
             if start < 0:
@@ -468,10 +542,23 @@ def parse_json(text: str) -> Any:
                 elif ch == closer:
                     depth -= 1
                     if depth == 0:
-                        try:
-                            return json.loads(cand[start : i + 1])
-                        except json.JSONDecodeError:
-                            break
+                        frag = cand[start : i + 1]
+                        ok, val = _try(frag)
+                        if ok:
+                            return val
+                        ok, val = _try(_strip_trailing_commas(frag))
+                        if ok:
+                            return val
+                        break
+
+    # 4) 截断补齐：对最宽候选（原始整段）做最小闭合修复后最后一搏
+    for cand in candidates:
+        repaired = _complete_truncated(cand)
+        if repaired:
+            ok, val = _try(repaired)
+            if ok:
+                logger.warning("模型输出疑似被截断，已按最小闭合修复后解析成功")
+                return val
     raise LLMError(f"无法解析模型输出为 JSON: {text[:200]}")
 
 

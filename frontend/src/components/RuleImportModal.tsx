@@ -43,7 +43,7 @@ export default function RuleImportModal({
 }: Props) {
   const { message } = AntdApp.useApp()
   const [file, setFile] = useState<File | null>(null)
-  const [target, setTarget] = useState<'new' | 'append'>('new')
+  const [target, setTarget] = useState<'new' | 'append' | 'byfile'>('new')
   const [name, setName] = useState('')
   const [importing, setImporting] = useState(false)
   const [result, setResult] = useState<ImportResult | null>(null)
@@ -77,6 +77,7 @@ export default function RuleImportModal({
       const res = await api.importRules(file, {
         rulesetName: target === 'new' ? name.trim() || undefined : undefined,
         appendTo: target === 'append' && isActiveCustom ? activeRulesetId : undefined,
+        byFile: target === 'byfile' || undefined,
       })
       setResult({
         imported: res.imported,
@@ -164,6 +165,10 @@ export default function RuleImportModal({
                     },
                   ]
                 : []),
+              {
+                value: 'byfile',
+                label: '按文件内「规则集名称」列分组建集（导出文件回导多集用）',
+              },
             ]}
           />
           {target === 'new' && (

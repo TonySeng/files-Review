@@ -1057,8 +1057,13 @@ async def create_ruleset(
     user_id: str | None = None,
     is_shared: bool = False,
     reuse: bool = True,
+    scope_user_id: str | None = None,
 ) -> dict[str, Any]:
-    """创建并（后台）启动一个临时规则集挖矿任务，立即返回记录。"""
+    """创建并（后台）启动一个临时规则集挖矿任务，立即返回记录。
+
+    scope_user_id 用于文件归属校验（管理员传 None 不过滤，普通用户传自身 id），
+    防止引用他人上传的法规文件。
+    """
     if not file_ids:
         raise ValueError("请至少选择一个法规文件")
     if mode not in ("bid", "tender", "general"):
@@ -1067,7 +1072,7 @@ async def create_ruleset(
     source_files: list[dict[str, Any]] = []
     source_meta: list[dict[str, Any]] = []
     for fid in file_ids:
-        rec = file_store.get(fid)
+        rec = file_store.get(fid, scope_user_id)
         if not rec:
             raise ValueError(f"文件不存在或已过期: {fid}")
         text = (rec.get("text") or "").strip()

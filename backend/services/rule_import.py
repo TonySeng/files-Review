@@ -397,6 +397,50 @@ def parse_rules_file(filename: str, data: bytes) -> tuple[list[dict[str, Any]], 
     return rules, errors
 
 
+def group_rules_for_import(
+    rules: list[dict[str, Any]],
+    *,
+    ruleset_name: str | None = None,
+    append_to: str | None = None,
+    byfile: bool | str | None = None,
+) -> dict[str, Any]:
+    """按导入目标对规则分组，决定走「单集新建/追加」还是「按文件内列多集分组」。
+
+    设计原则：**表单里的选择在优先级上高于文件内的「规则集名称」列**。
+
+    - 仅当用户显式选择“按文件内列分组建集”（byfile 为真）且未同时指定
+      append_to / ruleset_name 时，才依据每行 ruleset_name 分组（导出文件回导多集场景）。
+    - 其余情况一律忽略行内 ruleset_name 列，使所有规则归入单一未命名组，由调用方按
+      append_to（追加到指定集）或 ruleset_name/filename（新建集）处理。
+
+    返回：
+        {
+          "grouped": {组名或 None: [规则...]},
+          "use_row_grouping": bool,   # True 表示确实走了按列分组
+        }
+    调用方据此判断走单集分支（len==1 且含 None 键）还是多集分支。
+    """
+    use_row_grouping = (
+        bool(byfile)
+        and str(byfile).strip().lower() in ("1", "true", "yes")
+        and not append_to
+        and not (ruleset_name or "").strip()
+    )
+    if not use_row_grouping:
+        # 表单选择优先：抹掉行内列，避免被文件里残留的旧规则集名悄悄追加
+        for r in rules:
+            r.pop("ruleset_name", None)
+
+    from collections import defaultdict
+
+    grouped: dict[str | None, list[dict[str, Any]]] = defaultdict(list)
+    for r in rules:
+        gname = (r.get("ruleset_name") or "").strip() or None
+        grouped[gname].append(r)
+    return {"grouped": dict(grouped), "use_row_grouping": use_row_grouping}
+
+
+
 # ===================== 模板生成 =====================
 _TEMPLATE_HEADER = ["规则名称", "类别", "严重级别", "规则说明/条件", "审核要点", "需法规依据", "是否启用"]
 _TEMPLATE_EXAMPLE = [

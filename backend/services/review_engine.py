@@ -11,7 +11,7 @@ import re
 from typing import Any, AsyncIterator
 
 from .. import config
-from . import consistency_cache, feedback_store, findings_cache, kb_client, llm_client, prompts, rules_store, web_search_client
+from . import consistency_cache, feedback_store, file_types, findings_cache, kb_client, llm_client, prompts, rules_store, web_search_client
 from . import sections as sections_store
 from . import text_locator
 from . import versioning
@@ -290,6 +290,7 @@ async def _run_rule_prompt_guarded(
                 cache_prefix=cache_prefix,
                 temperature=temperature,
                 kb_state=kb_state,
+                mode=mode,
             )
         except llm_client.LLMContextOverflow as exc:
             last_exc = exc
@@ -323,14 +324,99 @@ def _rule_doc_type_filter(batch: list[dict[str, Any]]) -> set[str] | None:
     return types or None
 
 
+# 文件类型库名称 → 文档角色规范名的别名表。
+# 二者常非子串关系（「资质证明」vs「资格证明」），不做映射会导致营业执照/资质证书等
+# 同义文件名无法被该类型规则召回。
+_DOC_TYPE_NAME_ALIASES: dict[str, str] = {
+    "资质证明": "资格证明",
+    "资质文件": "资格证明",
+    "资格文件": "资格证明",
+    "资格证明材料": "资格证明",
+}
+
+
+def _doc_type_terms(type_ids: set[str]) -> list[str]:
+    """把规则关联的「文档类型 id」解析为可用于文件名匹配的检索词。
+
+    背景：doc_types 保存的是文件类型 id（如 ft-bid），而送审文件的 file_type 需用户在
+    上传时手动指定（系统不自动识别内容）——未指定时 file_type 为空，仅按 id 精确匹配会让
+    配了 doc_types 的规则匹配不到任何文件，进而「跳过不产生结论」。
+
+    因此把 id 解析为类型名称（如「投标文件」）及其同义角色关键词，用送审文件**名称**做
+    包含匹配，实现「依据规则关联文档类型、通过送审文件名称自动匹配待审文件」。
+    """
+    terms: list[str] = []
+    for tid in type_ids or ():
+        tid_s = str(tid).strip()
+        if not tid_s:
+            continue
+        name = ""
+        try:
+            # 注意：文件类型服务暴露的是 get(type_id)，不是 get_type
+            ft = file_types.get(tid_s)
+            if isinstance(ft, dict):
+                name = str(ft.get("name") or "").strip()
+        except Exception:  # noqa: BLE001 - 类型库异常不应阻断审核，退化为用 id 本身
+            name = ""
+        for t in (name or tid_s, tid_s):
+            if t and t not in terms:
+                terms.append(t)
+        # 同义角色关键词：类型名命中已知文档角色时，把该角色下的**全部同义词**补进来
+        # （如「资质证明」→ 营业执照/资质证书/资格证明），提升按文件名召回——
+        # 文件名往往不直书类型名（「营业执照.pdf」里没有「资质证明」四个字）。
+        if name:
+            canon_name = _DOC_TYPE_NAME_ALIASES.get(name, name)
+            hit_canons = {
+                canon
+                for kw, canon in _DOC_ROLE_KEYWORDS
+                if canon == canon_name
+                or canon_name in canon
+                or canon in canon_name
+                or kw == canon_name
+                or kw in canon_name
+                or canon_name in kw
+            }
+            if hit_canons:
+                for kw, canon in _DOC_ROLE_KEYWORDS:
+                    if canon in hit_canons and kw not in terms:
+                        terms.append(kw)
+    return terms
+
+
+def _doc_matches_types(
+    doc: dict[str, Any], type_ids: set[str], terms: list[str]
+) -> bool:
+    """送审文件是否命中规则关联的文档类型。
+
+    命中口径（任一即可）：
+      1) 显式指定：doc.file_type 等于类型 id（用户上传时手动指定，优先级最高）；
+      2) 文件名匹配：类型名称或其同义角色关键词出现在文件名中（自动匹配）。
+    """
+    ftype = doc.get("file_type") or None
+    if ftype is not None and str(ftype) in type_ids:
+        return True
+    name = str(doc.get("filename") or doc.get("file_name") or "")
+    if not name:
+        return False
+    return any(t and t in name for t in terms)
+
+
 def _applicable_docs(
     batch: list[dict[str, Any]], docs: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """按规则关联的文档类型过滤适用文档；未限定则适用全部文档。"""
+    """按规则关联的文档类型过滤适用文档；未限定则适用全部文档。
+
+    匹配先后：显式 file_type 精确匹配 → 送审文件**名称**包含类型名/同义词（自动匹配）。
+    后者使「未在上传时手动指定类型」的文件也能被正确纳入，避免规则因匹配不到文件被跳过。
+    """
     types = _rule_doc_type_filter(batch)
     if types is None:
         return list(docs)
-    return [d for d in docs if (d.get("file_type") or None) in types]
+    # 关闭自动匹配时退化为「仅 file_type 精确匹配」的旧行为（灰度/回退用）
+    if not bool(config.get("rule_doc_auto_match", True)):
+        return [d for d in docs if (d.get("file_type") or None) in types]
+    terms = _doc_type_terms(types)
+    return [d for d in docs if _doc_matches_types(d, types, terms)]
 
 
 def _batch_section_ids(batch: list[dict[str, Any]]) -> list[str]:
@@ -906,10 +992,15 @@ async def _run_with_kb(
     timeout: float | None = None,
     temperature: float | None = None,
     kb_state: dict | None = None,
+    mode: str = "bid",
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """执行一次审核请求，允许模型多轮调用知识库检索和联网搜索工具后再产出结论。"""
+    """执行一次审核请求，允许模型多轮调用知识库检索和联网搜索工具后再产出结论。
+
+    mode 决定 system 提示词口径：general=通用文档审核（不预设招投标背景），
+    bid/tender=招投标合规审核。
+    """
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": prompts.system_prompt()},
+        {"role": "system", "content": prompts.system_prompt(mode)},
         {"role": "user", "content": user_prompt},
     ]
     kb_traces: list[dict[str, Any]] = []
@@ -1276,15 +1367,332 @@ def _tender_label_mismatch(item: dict[str, Any], rule: dict[str, Any]) -> str | 
     return None
 
 
+# ==================== 无来源 / 臆造依据拦截（fail、warn 侧） ====================
+# 小参数模型（Spark Lite 等）在原文中取不到依据时，会从训练知识里「补」出处，
+# 典型有三种：
+#   ① 编造送审文件中不存在的外部价格（市场平均价 / 行业均价 / 历史成交价 / 经验值）；
+#   ② 把提示词对它说的填写要求（「无支撑结论的原文逐字摘录(10-200字)」）原样抄回 evidence；
+#   ③ 只抛一个裸数字串（「129.9 元/吨」）冒充原文摘录。
+# 共同点是 evidence 无法在送审全文中命中。检出即降级 unknown，
+# 杜绝「不合规」结论建立在模型臆造的「事实」之上。
+
+# 外部价格概念（送审文件之外的行情类数据，不能作为合规判断依据）
+_UNSOURCED_PRICE_TERMS = (
+    "市场平均价", "市场平均价格", "市场均价", "市场行情价", "市场行情",
+    "行业均价", "行业平均价", "行业平均水平", "行业参考价", "同行业均价",
+    "历史成交价", "历史均价", "往期成交价", "同期市场价", "周边项目价",
+    "预估市场价", "经验值",
+)
+
+# 提示词泄漏特征：只可能来自本系统提示词，几乎不可能出现在真实招采文件原文中
+_PROMPT_LEAK_MARKERS = (
+    "无支撑结论的原文逐字摘录", "支撑结论的原文逐字摘录", "逐字摘录",
+    "10-200字", "10-200 字",
+    "不得改写/概括/意译", "须与原始材料逐字一致",
+    "严禁填「无/暂无/未找到」", "只能从待审文件列表的真实文件名中选择",
+    "无法定位的泛称", "见下方【推理过程书写规范】", "【填写顺序",
+    "口径纪律", "要素来源与抽取纪律", "本规则未触发",
+    "待审文件内容", "送审文件清单", "招标文件关键要求",
+)
+
+_NUM_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+# 数字/单位/常见符号：用于判断 evidence 是否「几乎只剩裸数字」
+_NUM_NOISE_RE = re.compile(
+    r"[\d\.,\s%％°、/元万亿角分吨千克米㎡平方米厘天日个台套件人页第章节条款a-zA-Z]"
+)
+
+
+def _doc_corpus_from(docs: Any, limit: int = 400000) -> str:
+    """拼接送审文件正文，用于核验结论依据是否真实出自送审材料。"""
+    if not isinstance(docs, (list, tuple)):
+        return ""
+    parts: list[str] = []
+    total = 0
+    for d in docs:
+        if not isinstance(d, dict):
+            continue
+        t = str(d.get("text") or "")
+        if not t:
+            continue
+        parts.append(t)
+        total += len(t)
+        if total >= limit:
+            break
+    return "\n".join(parts)
+
+
+def _numbers_absent_in_corpus(evidence: str, corpus: str) -> bool:
+    """evidence 中的数字是否全部在送审全文中检索不到（原文无此数值）。"""
+    if not corpus or not evidence:
+        return False
+    nums = [n.replace(",", "") for n in _NUM_RE.findall(evidence)]
+    nums = [n for n in nums if len(n) >= 3]  # 1-2 位数字过于常见，不参与核验
+    if not nums:
+        return False
+    flat = re.sub(r"[,\s]", "", corpus)
+    return all(n not in flat for n in nums)
+
+
+def _evidence_is_thin_numeric(evidence: str, corpus: str) -> bool:
+    """evidence 几乎只剩裸数字（去掉数字与单位后实质汉字 < 6），且全文无此数值。
+
+    「市场平均价 129.9 元/吨」这类臆造数值的典型形态：没有可核验的原文语境。
+    有实质文字的摘录（如「投标报价 128 万元，超过最高限价 100 万元」）不会命中。
+    """
+    if not evidence:
+        return False
+    stripped = _NUM_NOISE_RE.sub("", evidence)
+    if len(stripped) >= 6:
+        return False
+    return _numbers_absent_in_corpus(evidence, corpus)
+
+
+def _fail_evidence_is_fabricated(
+    item: dict[str, Any], corpus: str = ""
+) -> tuple[str, str] | None:
+    """fail/warn 结论的依据是否疑似臆造，返回 (原因码, 命中说明) 或 None。
+
+    原因码：
+      unsourced_price —— 引用了送审文件之外的外部价格概念；
+      prompt_leak     —— evidence 抄回了提示词的填写要求原文；
+      thin_numeric    —— evidence 只剩裸数字且该数字在送审全文中不存在。
+    """
+    ev = str(item.get("evidence") or "")
+    blob = f"{item.get('title') or ''} {item.get('detail') or ''} {ev}"
+    # ① 外部价格概念：送审全文中确实出现过该词时放行（尊重原文表述）
+    for term in _UNSOURCED_PRICE_TERMS:
+        if term in blob and (not corpus or term not in corpus):
+            return ("unsourced_price", term)
+    # ② 提示词回抄：evidence 只能是原文摘录，指令性文字一律不合法
+    for marker in _PROMPT_LEAK_MARKERS:
+        if marker in ev:
+            return ("prompt_leak", marker)
+    # ③ 裸数字证据
+    if _evidence_is_thin_numeric(ev, corpus):
+        nums = _NUM_RE.findall(ev)
+        return ("thin_numeric", "、".join(nums[:3]) or "（无数字）")
+    return None
+
+
+# ==================== 结论标题（title）规范化 ====================
+# 模型（尤其小参数模型如 Spark Lite）常把 title 写成退化内容：
+#   ① 直接填状态词（pass / 通过 / 不合规）；② 填空结论占位词（无 / 无结论）；
+#   ③ 填文件名或文件类型（投标文件 / 报价得分表.xlsx / 会议纪要）。
+# 这类 title 在结果列表与导出报告里毫无信息量，且与 status 的对应关系混乱。
+# 本层统一判定「退化 title」并按 status 生成规范文案，保证：
+#   pass → 符合「规则名」要求    fail → 不合规：具体问题
+#   warn → 存疑：具体问题描述    unknown → 待确认：规则名（未获得明确结论）
+
+_TITLE_MAX = 60
+
+# 纯状态词：只表达判定结果、不含任何实质信息
+_TITLE_STATUS_WORDS = {
+    "pass", "fail", "warn", "unknown", "passed", "failed", "warning",
+    "通过", "不通过", "不合规", "合规", "合格", "不合格", "符合", "不符合",
+    "存疑", "待确认", "待人工复核", "待定", "无定论",
+    "ok", "okay", "true", "false", "yes", "no", "none", "null", "nil",
+    "n/a", "na", "-", "--", "无状态",
+}
+
+# 空结论占位词：看似有内容，实则没有给出任何核查对象或结论
+_TITLE_PLACEHOLDER_WORDS = {
+    "无", "无结论", "无问题", "无异常", "无异常情况", "无意见", "无违规",
+    "无违规项", "无问题项", "无结果", "无相关", "无内容",
+    "没有", "没有结论", "没有问题", "没有异常",
+    "未见异常", "未发现", "未发现问题", "未发现异常", "未发现违规",
+    "未发现违规情形", "未发现问题", "未获结论",
+    "暂无", "暂无结论", "已审核", "已核查", "已检查", "已阅",
+    "正常", "无需整改", "本规则未触发", "同上", "见正文", "见附件",
+}
+
+# 文件类型泛称：结论写成了审查对象而非结论本身
+_TITLE_FILE_TYPE_WORDS = {
+    "投标文件", "招标文件", "报价文件", "商务文件", "技术文件", "资格证明文件",
+    "资格审查文件", "开标记录", "开标一览表", "评标报告", "评审报告", "定标结果",
+    "中标通知书", "中标公告", "会议纪要", "合同", "营业执照", "授权委托书",
+    "承诺函", "投标函", "报价表", "报价得分表", "打分表", "评分表", "清单",
+    "附件", "正文", "扫描件", "复印件", "原件",
+}
+
+_TITLE_EXT_RE = re.compile(
+    r"\.(docx|doc|xlsx|xls|pdf|pptx|ppt|txt|zip|rar|7z|jpg|jpeg|png|bmp)$",
+    re.IGNORECASE,
+)
+
+
+def _norm_title_key(s: Any) -> str:
+    """title 归一化键：去首尾标点与全部空白、统一小写，用于退化词比对。"""
+    t = str(s or "").strip()
+    t = t.strip("。．：:，,；;、！!？?（）()《》〈〉\"'“”‘’ \t\r\n")
+    return re.sub(r"\s+", "", t).lower()
+
+
+def _title_is_file_like(title: str, doc_names: list[str] | None) -> bool:
+    """title 是否为文件名 / 文件类型（模型把送审清单里的文件名当结论写）。"""
+    t = _norm_title_key(title)
+    if not t:
+        return True
+    if _TITLE_EXT_RE.search(t):
+        return True  # 带扩展名 → 几乎必然是文件名而非结论
+    for n in doc_names or []:
+        key = _norm_title_key(re.sub(r"\.[A-Za-z0-9]{1,5}$", "", str(n or "")))
+        if not key or len(key) < 3:
+            continue
+        if t == key or (key in t and len(t) <= len(key) + 2):
+            return True
+    return t in _TITLE_FILE_TYPE_WORDS
+
+
+def _title_is_degenerate(title: Any, doc_names: list[str] | None = None) -> bool:
+    """title 是否为退化内容（空 / 状态词 / 占位词 / 文件名文件类型）。"""
+    t = _norm_title_key(title)
+    if len(t) <= 1:
+        return True
+    if t in _TITLE_STATUS_WORDS or t in _TITLE_PLACEHOLDER_WORDS:
+        return True
+    return _title_is_file_like(str(title or ""), doc_names)
+
+
+def _title_from_detail(detail: Any, maxlen: int = 30) -> str:
+    """title 退化时，从 detail 首句抽取具体问题作为替代文案。"""
+    text = str(detail or "").strip()
+    if not text:
+        return ""
+    for seg in re.split(r"[\n。；;！!？?]", text):
+        seg = seg.strip().strip("：:，,、")
+        # 去掉「经核查/经审核…」这类无信息量的引导语
+        seg = re.sub(
+            r"^(经核查|经审核|经检查|经评审|经比对|核查发现|检查发现|审核发现|比对发现)"
+            r"[，,：:]?",
+            "",
+            seg,
+        ).strip()
+        if len(seg) >= 4:
+            return seg[:maxlen].rstrip("，,、") + ("…" if len(seg) > maxlen else "")
+    return ""
+
+
+def _normalize_title(
+    status: str,
+    title: Any,
+    rule_name: str,
+    detail: Any = "",
+    doc_names: list[str] | None = None,
+) -> str:
+    """按 status 生成规范结论标题；模型给出的有效标题原样保留（截断到 60 字）。
+
+    退化标题（状态词 / 占位词 / 文件名文件类型）一律替换，替换优先级：
+      fail/warn：detail 首句 > 规则名兜底；pass/unknown：按状态生成固定句式。
+    """
+    raw = str(title or "").strip()
+    name = str(rule_name or "").strip()
+    if status == "pass":
+        if _title_is_degenerate(raw, doc_names):
+            return f"符合「{name}」要求" if name else "符合要求"
+        return raw[:_TITLE_MAX]
+    if status == "unknown":
+        if _title_is_degenerate(raw, doc_names):
+            return (
+                f"待确认：{name}（未获得明确结论）" if name else "待确认（未获得明确结论）"
+            )
+        return raw[:_TITLE_MAX]
+    prefix = "不合规" if status == "fail" else "存疑"
+    if _title_is_degenerate(raw, doc_names):
+        from_detail = _title_from_detail(detail)
+        if from_detail:
+            return f"{prefix}：{from_detail}"[:_TITLE_MAX]
+        return f"{prefix}：{name}" if name else prefix
+    return raw[:_TITLE_MAX]
+
+
+# status=pass 却报出实质问题的标记（模型状态填反的反向纠偏）
+_PASS_VIOLATION_MARKS = (
+    "未提供", "未提交", "未响应", "未加盖", "未签字", "未盖章", "未按规定",
+    "缺失", "缺少", "缺漏", "遗漏", "未填", "未附",
+    "不符合", "不满足", "不一致", "不对应", "矛盾", "冲突",
+    "错误", "有误", "笔误", "超期", "过期", "失效", "无效", "作废",
+    "否决", "废标", "雷同", "高度相似", "涂改", "重大偏差",
+    "超过上限", "超过最高限价", "低于下限", "不足最低要求",
+)
+
+_NEG_VERBS = ("未发现", "不存在", "未出现", "未构成", "未见", "没有", "不存", "未", "无")
+
+# 「未发现材料缺失」「不存在报价错误」这类否定式断言：先整段剥除再做标记检测，
+# 否则「未发现」与「缺失」中间隔着「材料」二字时会被误判成真问题。
+_NEG_CLAUSE_RE = re.compile(
+    r"(未发现|没有发现|不存在|未出现|未构成|不构成|并非|并未|未见)"
+    r"[^，,；;。！!？?]{0,12}"
+)
+
+
+def _seg_reports_violation(seg: str) -> bool:
+    """句段是否（非否定式地）报出了实质问题。
+
+    「未发现缺失」「报价未超过上限」这类否定式表述不计为问题；
+    「未提供营业执照」「报价超过上限」这类才是真问题。
+    """
+    if not seg:
+        return False
+    seg = _NEG_CLAUSE_RE.sub("", seg)
+    # 1) 以「未」开头的问题标记（未提供/未响应/未盖章…）：否定字本身就是问题的一部分，
+    #    仅当其前一字仍是否定词（几乎不出现）时才排除。
+    for m in _PASS_VIOLATION_MARKS:
+        if not m.startswith("未"):
+            continue
+        i = 0
+        while True:
+            j = seg.find(m, i)
+            if j < 0:
+                break
+            prev = seg[j - 1] if j > 0 else ""
+            if prev not in ("不", "无"):
+                return True
+            i = j + 1
+    # 2) 其余标记：前面 3 字内出现否定动词（未发现/不存在/未/无…）则不计
+    for m in _PASS_VIOLATION_MARKS:
+        if m.startswith("未"):
+            continue
+        i = 0
+        while True:
+            j = seg.find(m, i)
+            if j < 0:
+                break
+            if any(v in seg[max(0, j - 3): j] for v in _NEG_VERBS):
+                i = j + 1
+                continue
+            return True
+    return False
+
+
+def _pass_but_reports_violation(item: dict[str, Any]) -> bool:
+    """status=pass 但 title/detail 结语句明确报出问题 → 状态填反。
+
+    与 _explicitly_reports_no_violation（fail→pass）互为反向纠偏，
+    避免「判定通过，但结论写着缺少营业执照」这类自相矛盾的结果。
+    """
+    # 结语句只看 detail（title 可能是「通过」这类退化词，拼接后会盖住 detail 的结论句）
+    for seg in (
+        str(item.get("title") or ""),
+        _conclusion_sentence({"detail": item.get("detail") or ""}),
+    ):
+        if _seg_reports_violation(seg):
+            return True
+    return False
+
+
 def _normalize_findings(
     raw: Any,
     batch: list[dict[str, Any]],
     doc_names: list[str] | None = None,
+    corpus: str = "",
 ) -> list[dict[str, Any]]:
     """把模型输出对齐到规则定义，补齐缺失项。
 
     错别字规则若一次命中多处错字，模型以 typo 数组返回，本函数将其拆分为多条
     独立结论（每条一个 typo），使审核结果、反馈与训练数据均能「逐条」记录。
+
+    corpus 为送审文件正文拼接，用于核验 evidence 是否真实出自送审材料
+    （反幻觉：拦截外部价格、提示词回抄、裸数字三类臆造依据）。
     """
     items = raw.get("findings") if isinstance(raw, dict) else raw
     if not isinstance(items, list):
@@ -1312,13 +1720,24 @@ def _normalize_findings(
         duplicate_unverified = False
         file_unresolved = False
         typo_entity = False
+        pass_contradiction = False
+        fabricated: tuple[str, str] | None = None
         tender_mismatch = _tender_label_mismatch(item, rule)
         if tender_mismatch and status in ("fail", "warn"):
             # 模型把招标文件摘要中的关注点直接当成了本规则的结论：
             # 例如 dec-03 打分规则下出现「人员要求不符合招标文件要求」「否决投标情形」。
             # 这类结论与当前规则说明完全脱节，直接降级为 unknown 并提示人工复核。
             status = "unknown"
-        if status == "fail" and _explicitly_reports_no_violation(item):
+        # 反幻觉预检：本条结论的依据是否疑似臆造（外部价格 / 提示词回抄 / 裸数字）
+        if status in ("fail", "warn"):
+            fabricated = _fail_evidence_is_fabricated(item, corpus)
+        if (
+            status == "fail"
+            and (
+                _explicitly_reports_no_violation(item)
+                or _evidence_implies_pass(item)  # evidence 写 pass 含义（含被误填为 JSON 结构的字段）
+            )
+        ):
             # 结语句明确「未发现/不存在 + 违规对象」却填 fail → 直接纠正为通过，
             # 并清空定位类字段（通过结论不携带原文定位，证据「无」无定位意义）。
             status = "pass"
@@ -1350,6 +1769,10 @@ def _normalize_findings(
             # 降级待人工复核，杜绝「引用不存在的投标文件」这类幻觉结论。
             status = "unknown"
             file_unresolved = True
+        elif status in ("fail", "warn") and fabricated:
+            # 依据疑似臆造（外部价格 / 提示词回抄 / 裸数字），送审全文中检索不到。
+            # 结论的「事实基础」不成立，降级待人工复核，杜绝臆造型不合规判定。
+            status = "unknown"
         elif (
             status in ("fail", "warn")
             and str(rule.get("id") or "") in _TYPO_RULE_SCOPE
@@ -1359,6 +1782,12 @@ def _normalize_findings(
             # 行文错别字，应判定为无错别字(pass)，避免把合法公司名标成错别字。
             status = "pass"
             typo_entity = True
+        elif status == "pass" and _pass_but_reports_violation(item):
+            # 反向纠偏：结构化字段标 pass，但 title/detail 结语句明确报出问题
+            # （如「缺少营业执照」「报价超过上限」）。与上面的 fail→pass 纠偏对称，
+            # 降级为待人工复核，避免把不合规项标成「通过」。
+            status = "unknown"
+            pass_contradiction = True
         try:
             confidence = float(item.get("confidence") or 0)
         except (TypeError, ValueError):
@@ -1369,7 +1798,7 @@ def _normalize_findings(
             "category": rule.get("category", ""),
             "severity": rule.get("severity", "major"),
             "status": status,
-            "title": str(item.get("title") or "")[:300],
+            "title": "",  # 末尾按 status 统一生成（见 _normalize_title）
             "detail": str(item.get("detail") or ""),
             "evidence": str(item.get("evidence") or "")[:1200],
             "location": str(item.get("location") or ""),
@@ -1435,6 +1864,33 @@ def _normalize_findings(
                 + f"\n\n⚠️ 结论引用的文件「{cited}」不在本次送审文件范围内，"
                 "属于无来源引用，已自动降级为「待人工复核」，请人工核实原文。"
             ).strip()
+        if fabricated:
+            # 依据疑似臆造：清空不可核验的 evidence 与定位字段，交人工复核。
+            _code, _hit = fabricated
+            _FAB_REASON = {
+                "unsourced_price": (
+                    f"结论引用了送审文件中不存在的外部价格概念「{_hit}」"
+                    "（市场价/行业均价/历史成交价等）。合规判断只能依据送审文件原文与法规，"
+                    "模型自行引入的行情数据不构成审核依据。"
+                ),
+                "prompt_leak": (
+                    f"evidence 抄写了提示词的填写要求原文（「{_hit}」），"
+                    "并非送审文件的原文摘录，属于无效依据。"
+                ),
+                "thin_numeric": (
+                    f"evidence 仅为裸数值「{_hit}」，在送审全文中检索不到对应原文，"
+                    "缺少可核验的原文语境，无法判断其来源。"
+                ),
+            }
+            base["evidence"] = ""
+            base["location"] = ""
+            base["involved_files"] = []
+            base["evidence_fabricated"] = _code
+            base["detail"] = (
+                base["detail"]
+                + f"\n\n⚠️ {_FAB_REASON.get(_code, '结论依据无法在送审材料中核验。')}"
+                "已自动降级为「待人工复核」，请人工核实原文后再判定。"
+            ).strip()
         if typo_entity:
             # 错别字结论把两个主体名称(公司名)当成正误关系：专有名词不是行文错别字，
             # 纠正为「通过」(无错别字)，避免把合法公司名称标成错别字。
@@ -1461,6 +1917,26 @@ def _normalize_findings(
                 f"出现了「{tender_mismatch}」等招标文件摘要中的关注点，而当前规则并不负责审查该项。"
                 "已自动降级为「待人工复核」，请人工核对是否应归入其他规则。"
             ).strip()
+        if pass_contradiction:
+            # 状态填反（pass 但报出问题）：降级为待人工复核，保留原结论供人工核对。
+            base["status"] = "unknown"
+            base["pass_contradiction"] = True
+            base["detail"] = (
+                base["detail"]
+                + "\n\n⚠️ 模型判定为「通过」，但结论文本中明确报出了具体问题"
+                "（如缺失/超过上限/不一致等），状态与结论自相矛盾，"
+                "已自动降级为「待人工复核」，请人工核实原文后判定。"
+            ).strip()
+        # 结论标题统一规范化：状态词/占位词/文件名类退化标题按 status 重写，
+        # 使 title 与 status 严格对应（pass=符合…、fail=不合规：…、
+        # warn=存疑：…、unknown=待确认：…），消除「title=pass/无/文件名」。
+        base["title"] = _normalize_title(
+            base["status"],
+            item.get("title"),
+            rule.get("name", ""),
+            item.get("detail"),
+            doc_names,
+        )
         typos = _collect_typos(item, rule_id)
         if not typos:
             findings.append(base)
@@ -1543,6 +2019,11 @@ def _normalize_finding_deterministic(f: dict[str, Any]) -> dict[str, Any]:
         sev = "major"
     out["severity"] = sev
     out["deterministic"] = True
+    # 确定性结论的 title 由引擎生成，理论上已规范；再过一层归一化，
+    # 保证与 LLM 结论走同一套「title ↔ status」对应规则。
+    out["title"] = _normalize_title(
+        out["status"], out.get("title"), out.get("rule_name", ""), out.get("detail")
+    )
     return out
 
 
@@ -1742,6 +2223,228 @@ def _attach_locations(
             f["location"] = ""
 
 
+_STATUS_ORDER = {"fail": 0, "warn": 1, "unknown": 2, "pass": 3}
+_STATUS_BY_ORDER = {v: k for k, v in _STATUS_ORDER.items()}
+
+
+def _file_result_groups(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把一条规则下的若干结论按「文件」维度归组，供前端从规则/结论下钻查看逐条明细。
+
+    归组口径：按 finding.involved_files 归属——跨文件结论（involved_files 列多个文件）
+    归入其列出的每个文件（该结论确实同时涉及这些文件）；未关联文件的结论（如确定性
+    规则结论）归入「（未关联文件）」桶，保证下钻不丢条目。文件组的 status 取组内
+    最严重结论，issue_count 统计组内 fail/warn/unknown 条数。
+    """
+
+    def _status_of(it: dict[str, Any]) -> str:
+        return str(it.get("status") or "pass")
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for it in items:
+        files = [str(x) for x in (it.get("involved_files") or []) if str(x).strip()]
+        for fname in files or ["（未关联文件）"]:
+            groups.setdefault(fname, []).append(it)
+    out_files: list[dict[str, Any]] = []
+    for fname, its in groups.items():
+        worst = min(
+            (_STATUS_ORDER.get(_status_of(it), 3) for it in its), default=3
+        )
+        out_files.append(
+            {
+                "file": fname,
+                "status": _STATUS_BY_ORDER[worst],
+                "issue_count": sum(
+                    1 for it in its if _status_of(it) in ("fail", "warn", "unknown")
+                ),
+                "findings": [
+                    {
+                        "status": _status_of(it),
+                        "title": str(it.get("title") or ""),
+                        "detail": str(it.get("detail") or ""),
+                        "evidence": str(it.get("evidence") or ""),
+                        "location": str(it.get("location") or ""),
+                        "suggestion": str(it.get("suggestion") or ""),
+                        "confidence": it.get("confidence"),
+                        # 结构化原文定位（_attach_locations 已在聚合前附加）
+                        "locations": it.get("locations") or [],
+                    }
+                    for it in its
+                ],
+            }
+        )
+    # 文件名排序保证多次查询返回顺序稳定
+    out_files.sort(key=lambda x: x["file"])
+    return out_files
+
+
+def _rule_conclusion_detail(
+    rule_name: str,
+    status: str,
+    file_groups: list[dict[str, Any]],
+    *,
+    max_files: int = 8,
+    max_items: int = 5,
+) -> str:
+    """生成「每规则一条」结论的推理过程：简洁、结构化、可追溯。
+
+    结构固定为三段，便于快速阅读与事后追溯：
+      【结论】整体判定 + 涉及文件数 + 问题数
+      【核查范围】本规则实际审核的文件清单（来自规则关联文档类型的自动匹配结果）
+      【问题明细】按文件归组的逐条问题（依据 + 定位），超量截断并提示看下钻
+    """
+    status_label = {
+        "fail": "不合规", "warn": "存疑", "unknown": "待确认", "pass": "通过",
+    }.get(status, status)
+    total_issues = sum(int(g.get("issue_count") or 0) for g in file_groups)
+    files = [str(g.get("file") or "") for g in file_groups]
+    files = [f for f in files if f and f != "（未关联文件）"] or [
+        str(g.get("file") or "") for g in file_groups
+    ]
+
+    if status == "pass" or total_issues == 0:
+        scope = "、".join(files) if files else "（未关联到具体文件）"
+        return (
+            f"【结论】{status_label} · 已核查 {len(file_groups)} 个文件，未发现问题\n"
+            f"【核查范围】{scope}"
+        )
+
+    scope = "、".join(files) if files else "（未关联到具体文件）"
+    lines: list[str] = [
+        f"【结论】{status_label} · 涉及 {len(file_groups)} 个文件 · 共 {total_issues} 项问题",
+        f"【核查范围】{scope}",
+        "【问题明细】",
+    ]
+    shown_files = 0
+    hidden_files = 0
+    for g in file_groups:
+        if shown_files >= max_files:
+            hidden_files += 1
+            continue
+        gname = str(g.get("file") or "（未关联文件）")
+        gstatus = {
+            "fail": "不合规", "warn": "存疑", "unknown": "待确认", "pass": "通过",
+        }.get(str(g.get("status") or "pass"), "通过")
+        g_items = [it for it in (g.get("findings") or []) if str(it.get("status") or "pass") != "pass"]
+        g_all = g.get("findings") or []
+        if not g_items:
+            g_items = g_all
+        lines.append(f"{shown_files + 1}. 【{gname}】{gstatus}（{len(g_items)} 项）")
+        shown_items = 0
+        hidden_items = 0
+        for it in g_items:
+            if shown_items >= max_items:
+                hidden_items += 1
+                continue
+            title = str(it.get("title") or "").strip() or "（未命名问题）"
+            lines.append(f"   ① {title}")
+            ev = str(it.get("evidence") or "").strip()
+            if ev:
+                lines.append(f"      依据：{ev[:120]}{'…' if len(ev) > 120 else ''}")
+            loc = str(it.get("location") or "").strip()
+            if loc:
+                lines.append(f"      定位：{loc[:80]}{'…' if len(loc) > 80 else ''}")
+            shown_items += 1
+        if hidden_items:
+            lines.append(f"   ……该文件另有 {hidden_items} 项，见下钻明细")
+        shown_files += 1
+    if hidden_files:
+        lines.append(f"……另有 {hidden_files} 个文件的问题，见下钻明细")
+    return "\n".join(lines)
+
+
+def _collapse_findings_per_rule(
+    findings: list[dict[str, Any]],
+    rules: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """把「多文件/分段并行」产生的 N 条结论收敛为「每规则一条」。
+
+    背景：多文件任务下同一条规则会对每个文件各产出一次结论（按文件切片并行），
+    合并时 fail/warn 仅按 (rule_id, title) 去重，标题略有差异即残留多条，
+    最终结论数膨胀为「规则数 × 文件数」。本函数按规则维度收敛：
+
+      - 状态：取 fail > warn > unknown > pass 的最严重项；
+      - 推理过程：重写为简洁、结构化、可追溯的汇总文本（见 _rule_conclusion_detail）；
+      - 证据与定位：沿用最严重项的 evidence/location，locations 取全部并集去重；
+      - 涉及文件：取全部结论的 involved_files 并集（顺序稳定）；
+      - 明细不丢：各文件的逐条结论完整保留在 file_results 中，供前端下钻。
+
+    单条结论的规则原样返回（仅补 file_results），不改变既有行为。
+    """
+    by_rule: dict[str, list[dict[str, Any]]] = {}
+    for f in findings:
+        by_rule.setdefault(str(f.get("rule_id") or ""), []).append(f)
+
+    # 输出顺序：先按规则编排顺序（保证与 rules 列表一致），再补未登记的规则
+    known_ids = [str(r.get("id") or "") for r in rules]
+    rule_name_of = {str(r.get("id") or ""): str(r.get("name") or "") for r in rules}
+    ordered_ids = [rid for rid in known_ids if rid in by_rule]
+    ordered_ids += [rid for rid in by_rule if rid not in ordered_ids]
+
+    out: list[dict[str, Any]] = []
+    for rid in ordered_ids:
+        items = by_rule[rid]
+        if len(items) == 1:
+            one = dict(items[0])
+            if not one.get("file_results"):
+                one["file_results"] = _file_result_groups(items)
+            one.setdefault(
+                "issue_count",
+                sum(1 for it in items if str(it.get("status") or "pass") != "pass"),
+            )
+            out.append(one)
+            continue
+
+        # 最严重项作为代表（同严重度时取编排顺序在前的一条，保证确定性）
+        ranked = sorted(
+            items,
+            key=lambda it: (
+                _STATUS_ORDER.get(str(it.get("status") or "pass"), 3),
+                -SEVERITY_ORDER.get(str(it.get("severity") or "major"), 1),
+            ),
+        )
+        base = ranked[0]
+        merged: dict[str, Any] = dict(base)
+
+        # 涉及文件并集（保持首次出现顺序）
+        inv: list[str] = []
+        for it in items:
+            for fname in it.get("involved_files") or []:
+                s = str(fname).strip()
+                if s and s not in inv:
+                    inv.append(s)
+        if inv:
+            merged["involved_files"] = inv
+
+        # 结构化定位并集去重（跨文件/跨段各条结论的定位全部保留）
+        locs: list[Any] = []
+        seen_loc: set[str] = set()
+        for it in items:
+            for loc in it.get("locations") or []:
+                try:
+                    key = json.dumps(loc, ensure_ascii=False, sort_keys=True)
+                except (TypeError, ValueError):
+                    key = str(loc)
+                if key not in seen_loc:
+                    seen_loc.add(key)
+                    locs.append(loc)
+        if locs:
+            merged["locations"] = locs
+
+        file_groups = _file_result_groups(items)
+        status = str(base.get("status") or "pass")
+        merged["file_results"] = file_groups
+        merged["issue_count"] = sum(
+            1 for it in items if str(it.get("status") or "pass") != "pass"
+        )
+        merged["detail"] = _rule_conclusion_detail(
+            rule_name_of.get(rid) or str(base.get("rule_name") or ""),
+            status,
+            file_groups,
+        )
+        out.append(merged)
+    return out
+
+
 def _aggregate_rule_results(
     findings: list[dict[str, Any]], rules: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -1757,53 +2460,6 @@ def _aggregate_rule_results(
         by_rule.setdefault(rid, []).append(f)
     order = {"fail": 0, "warn": 1, "unknown": 2, "pass": 3}
     name_of = {v: k for k, v in order.items()}
-
-    def _file_results(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """把一条规则下的若干结论按「文件」维度归组，供前端从规则下钻查看逐条结论。
-
-        归组口径：按 finding.involved_files 归属——跨文件结论（involved_files 列多个文件）
-        归入其列出的每个文件（该结论确实同时涉及这些文件）；未关联文件的结论（如确定性
-        规则结论）归入「（未关联文件）」桶，保证下钻不丢条目。文件组的 status 取组内
-        最严重结论，issue_count 统计组内 fail/warn/unknown 条数。
-        """
-
-        def _status_of(it: dict[str, Any]) -> str:
-            return str(it.get("status") or "pass")
-
-        groups: dict[str, list[dict[str, Any]]] = {}
-        for it in items:
-            files = [str(x) for x in (it.get("involved_files") or []) if str(x).strip()]
-            for fname in files or ["（未关联文件）"]:
-                groups.setdefault(fname, []).append(it)
-        out_files: list[dict[str, Any]] = []
-        for fname, its in groups.items():
-            worst = min((order.get(_status_of(it), 3) for it in its), default=3)
-            out_files.append(
-                {
-                    "file": fname,
-                    "status": name_of[worst],
-                    "issue_count": sum(
-                        1 for it in its if _status_of(it) in ("fail", "warn", "unknown")
-                    ),
-                    "findings": [
-                        {
-                            "status": _status_of(it),
-                            "title": str(it.get("title") or ""),
-                            "detail": str(it.get("detail") or ""),
-                            "evidence": str(it.get("evidence") or ""),
-                            "location": str(it.get("location") or ""),
-                            "suggestion": str(it.get("suggestion") or ""),
-                            "confidence": it.get("confidence"),
-                            # 结构化原文定位（_attach_locations 已在聚合前附加）
-                            "locations": it.get("locations") or [],
-                        }
-                        for it in its
-                    ],
-                }
-            )
-        # 文件名排序保证多次查询返回顺序稳定
-        out_files.sort(key=lambda x: x["file"])
-        return out_files
 
     out: list[dict[str, Any]] = []
     for r in rules:
@@ -1835,7 +2491,10 @@ def _aggregate_rule_results(
                 "issue_count": issue_count,
                 "samples": samples,
                 # 文件级结论明细：前端可从规则行下钻，查看该规则针对每个文件的逐条结论
-                "file_results": _file_results(items),
+                # 结论已按规则折叠时（_collapse_findings_per_rule）自带 file_results，
+                # 直接复用，避免按 involved_files 重新归组导致明细重复膨胀。
+                "file_results": (items[0].get("file_results") if len(items) == 1 else None)
+                or _file_result_groups(items),
             }
         )
     return out
@@ -1876,8 +2535,8 @@ def _as_field_list(field) -> list[str]:
     return [str(field).strip()] if str(field).strip() else []
 
 
-def _extract_amount_near(text: str, field) -> float | None:
-    """在文本中抽取 field 字段名附近的金额（兼容 万/千/亿 单位），统一换算为「元」。
+def _extract_amount_near_ex(text: str, field) -> tuple[float | None, bool]:
+    """在文本中抽取 field 字段名附近的金额，返回 (金额元, 是否歧义)。
 
     field 可为字符串或候选名列表（按顺序尝试）。用于金额对（如暂估价 vs 中标价）的
     确定性抽取与差值比较，避免依赖 LLM 的数值解析（LLM 易把「差额65400元」误读为 fail）。
@@ -1885,12 +2544,18 @@ def _extract_amount_near(text: str, field) -> float | None:
     抽取策略：优先在字段名「之后」搜索（字段名在前、金额在后的主流语序，如「暂估价44万元」），
     向后窗口不会误吞前序其他字段的金额；仅当向后搜索失败时，才向前兜底（覆盖「44万元暂估价」）。
     后置单位缺失时还会识别「单位前置」写法（如「暂估价(万元) 172.7」→ 1,727,000 元）。
+
+    歧义保护（新增，修复「结构化层锁死错误金额结论」）：
+    - 同一字段名在全文出现多次（>1）；或
+    - 字段名之后的窗口内出现多个「取值不同」的金额，
+    则判定为「无法确定该字段对应的唯一数值」，返回 (None, True)。调用方据此
+    **回落 LLM**（而不是用一个可能抓错的数值去锁定 fail/pass 结论）。
     """
     if not text:
-        return None
+        return None, False
     candidates = _as_field_list(field)
     if not candidates:
-        return None
+        return None, False
 
     def _apply_unit(val: float, unit: str | None) -> float:
         mult = 1.0
@@ -1903,14 +2568,7 @@ def _extract_amount_near(text: str, field) -> float | None:
         return val * mult
 
     def _leading_unit(prefix: str) -> str | None:
-        """识别「单位前置」写法（如「暂估价(万元) 172.7」→ 万）。
-
-        表头/分项表里单位常写在数字**前面**，此时数字后面没有单位，只按后置单位解析
-        会把 172.7 万元读成 172.7 元，与「中标价 152万元」(1,520,000 元) 相差百万倍，
-        差值比较必然失真。故后置单位缺失时，回看数字前的短前缀是否就是单位声明。
-        前缀限长 4 字——过长说明中间夹了别的词（如「(万元)：本次招标控制价 5000」），
-        单位与数字已非直接修饰关系，此时宁可不套用，避免错乘。
-        """
+        """识别「单位前置」写法（如「暂估价(万元) 172.7」→ 万）。"""
         s = _re.sub(r"[\s:：为（(）)\[\]【】,，]", "", prefix or "")
         if not s or len(s) > 4:
             return None
@@ -1919,15 +2577,13 @@ def _extract_amount_near(text: str, field) -> float | None:
                 return unit[0]
         return None
 
-    for cand in candidates:
-        idx = text.lower().find(cand.lower())
-        if idx < 0:
-            continue
+    def _amount_at(idx: int, cand: str) -> float | None:
+        """在字段名 cand（位于 idx）附近抽取单个金额：先向后，再向前兜底。"""
         start = idx + len(cand)
-        # 1) 优先向后：字段名之后 60 字内首个金额
+        # 1) 优先向后：字段名之后 60 字内「首个」金额（只取第一个，避免误纳页码等远处数字）
         fwd = text[start: start + 60]
         m = _re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(万|千|亿)?", fwd)
-        if m:
+        if m and m.group(1):
             try:
                 unit = m.group(2) or _leading_unit(fwd[: m.start()])
                 return _apply_unit(float(m.group(1)), unit)
@@ -1935,14 +2591,42 @@ def _extract_amount_near(text: str, field) -> float | None:
                 pass
         # 2) 兜底向前：字段名之前 30 字内最后一个金额（如「44万元暂估价」）
         bwd = text[max(0, idx - 30): idx]
-        nums = list(_re.finditer(r"([0-9]+(?:\.[0-9]+)?)\s*(万|千|亿)?", bwd))
+        nums = [mm for mm in _re.finditer(r"([0-9]+(?:\.[0-9]+)?)\s*(万|千|亿)?", bwd) if mm.group(1)]
         if nums:
             m = nums[-1]
             try:
                 return _apply_unit(float(m.group(1)), m.group(2))
             except (TypeError, ValueError):
                 pass
-    return None
+        return None
+
+    tl = text.lower()
+    for cand in candidates:
+        cl = cand.lower()
+        if cl not in tl:
+            continue
+        # 扫描该字段名的「全部」出现处，各自抽取金额后比对：
+        # - 只解析到唯一取值（含多处出现但取值一致，属互相印证）→ 确定，返回该值；
+        # - 解析到多个「不同」取值 → 歧义，无法确定唯一数值 → 返回 (None, True) 交 LLM 判定。
+        vals: list[float] = []
+        pos = tl.find(cl)
+        while pos >= 0:
+            v = _amount_at(pos, cand)
+            if v is not None:
+                vals.append(v)
+            pos = tl.find(cl, pos + len(cl))
+        distinct = {round(v, 2) for v in vals}
+        if len(distinct) > 1:
+            return None, True
+        if vals:
+            return vals[0], False
+    return None, False
+
+
+def _extract_amount_near(text: str, field) -> float | None:
+    """向后兼容包装：仅返回金额（歧义视同抽取失败 → None）。"""
+    val, _ambiguous = _extract_amount_near_ex(text, field)
+    return val
 
 
 def _opt_float(val: Any) -> float | None:
@@ -1973,6 +2657,15 @@ def _pair_is_violation(diff: float, threshold: float, fail_when: str) -> bool:
 _NO_VIOLATION_MARKS = (
     "未发现", "未存在", "不存在", "未见", "未出现", "未涉及",
     "均符合", "均满足", "符合要求", "满足要求", "不构成",
+    # 高置信复合短语：限价/上限类的「远低于/未达到」对照表达，单独"远低于"易误伤
+    # （"远低于合理水平"是 fail），所以只用与限价/上限绑定的完整短语
+    "远低于此最高限价", "远低于最高限价", "远低于上限", "远低于限价",
+    "未达到最高限价", "未达到上限", "未达到限价",
+    "未超过最高限价", "未超过上限", "未超过限价",
+    "不超过最高限价", "不超过上限", "不超过限价",
+    "低于最高限价", "低于上限", "低于限价",
+    "符合招标文件要求", "符合招标要求", "符合本次招标要求",
+    "在合理区间", "在合规区间", "在限价以内", "在限价以下",
 )
 # 与违规语义搭配的名词：单独「未发现」不够（可能后面接真实问题），需「未发现+违规对象」
 _VIOLATION_NOUNS = (
@@ -2409,6 +3102,80 @@ def _finding_text_contradicts_fail(item: dict[str, Any]) -> bool:
     return False
 
 
+# ==================== evidence 字段反查补强 ====================
+# 模型经常把结论文本写进 evidence 字段而不是 detail，又有时把字段结构当成字符串
+# 塞进 evidence（`{title:..., reason:...}`）。两种情况都会让上面只看 detail+title 的
+# 纠偏逻辑失效。本层先识别 evidence 是否是结构化字段串并抽取出关键 reason/conclusion
+# 字段值，再做 pass 意图检测；目的是让"evidence 写的是 pass 含义却标 fail"的结论
+# 同样被纠偏/降级。
+
+_EVIDENCE_FIELD_KEYS = (
+    "reason", "conclusion", "result", "summary", "判定",
+    "原因", "分析", "说明", "结论",
+    "title", "detail", "evidence",
+)
+
+
+def _extract_evidence_body(evidence: Any) -> str:
+    """若 evidence 被填成 `{key: value, ...}` 结构化字符串，抽取关键字段值串接返回。
+
+    真实原文摘录里出现 `{` 字符的概率极低（仅当原文含 JSON 模板/代码段），影响可控。
+    """
+    s = str(evidence or "").strip()
+    if not s or not (s.startswith("{") and s.endswith("}")):
+        return s
+    inner = s[1:-1]
+    parts: list[str] = []
+    seen: set[str] = set()
+    for key in _EVIDENCE_FIELD_KEYS:
+        if key in seen:
+            continue
+        m = re.search(rf"(?<![\w一-鿿]){re.escape(key)}\s*[:：]\s*", inner)
+        if not m:
+            continue
+        rest = inner[m.end():]
+        # 截到下一个 "key:" 模式（前一个 key 已被 seen 跳过，可用更通用切分）
+        cut = re.search(r"\s*[,，;；]\s*[A-Za-z_一-鿿]{2,}\s*[:：]", rest)
+        val = rest[: cut.start()] if cut else rest
+        val = val.strip().strip("\"'“”‘’…").rstrip("。")
+        if val and len(val) >= 2:
+            parts.append(val)
+            seen.add(key)
+    return "；".join(parts) if parts else s
+
+
+def _evidence_implies_pass(item: dict[str, Any]) -> bool:
+    """evidence（含被误填为 JSON 结构的字段值）是否在表达 pass 含义。
+
+    与 _explicitly_reports_no_violation 同源判据，但只读 evidence；用于「evidence 写
+    pass 含义却标 fail」的纠偏。判定通过时与 detail/title 的纠偏等效。
+
+    两条路径：
+      A) 限价对照类（远低于/未达到/不超过 + 限价/上限）—— 本身就是 pass 强信号，
+         不要求搭配「违规/违法」等名词（数值合规未必提及违规）；
+      B) 通用「未发现/不存在 + 违规对象」—— 与 _explicitly_reports_no_violation 同源。
+    """
+    body = _extract_evidence_body(item.get("evidence"))
+    if not body:
+        return False
+    # 路径 A：限价对照类强信号
+    price_hit = [m for m in _NO_VIOLATION_MARKS if m in body and ("限价" in m or "上限" in m)]
+    if price_hit:
+        stripped = body
+        for m in price_hit:
+            stripped = stripped.replace(m, "")
+        return not any(m in stripped for m in _FAIL_TAIL_MARKS)
+    # 路径 B：通用「未发现 + 违规对象」
+    if not _has_non_negated(body, _NO_VIOLATION_MARKS):
+        return False
+    if not any(n in body for n in _VIOLATION_NOUNS):
+        return False
+    stripped = body
+    for m in _NO_VIOLATION_MARKS:
+        stripped = stripped.replace(m, "")
+    return not any(m in stripped for m in _FAIL_TAIL_MARKS)
+
+
 def _apply_structured_rules(
     rules: list[dict[str, Any]], docs: list[dict[str, Any]], per_doc_full: list[str]
 ) -> dict[str, dict[str, Any]]:
@@ -2436,6 +3203,8 @@ def _apply_structured_rules(
         sec_ids = [
             str(x).strip() for x in (rule.get("section_ids") or []) if str(x).strip()
         ]
+        # 适用文档下标（供「必含要素缺失」类判定回查未截断全文，避免截断误报缺失）
+        applicable_docs: list[dict[str, Any]] = []
         if sec_ids:
             parts: list[str] = []
             for d in docs:
@@ -2447,17 +3216,35 @@ def _apply_structured_rules(
                 body, _names = _scoped_text(d, defs)
                 if body.strip():
                     parts.append(body)
+                    applicable_docs.append(d)
             rule_text = "\n\n".join(parts) or ""
         elif types is None:
             rule_text = "\n\n".join(b for b in per_doc_full if b) or ""
+            applicable_docs = list(docs)
         else:
             rule_idx = [i for i, d in enumerate(docs) if (d.get("file_type") or None) in types]
             rule_text = (
                 "\n\n".join(per_doc_full[i] for i in rule_idx if i < len(per_doc_full)) or ""
             )
+            applicable_docs = [docs[i] for i in rule_idx if i < len(docs)]
         if not rule_text.strip():
             continue  # 无匹配文档 → 跳过该规则，不执行审核
         text_lower = rule_text.lower()
+        # 未截断全文（仅按需构造）：用于「必含要素缺失」判定，避免要素恰好落在
+        # max_chars_per_doc 截断后的中/尾段而被误判为缺失、进而锁死一个错误 fail。
+        _full_lower_cache: str | None = None
+
+        def _full_text_lower() -> str:
+            nonlocal _full_lower_cache
+            if _full_lower_cache is None:
+                if sec_ids:
+                    _full_lower_cache = rule_text.lower()  # 章节裁剪场景本就是原文子集
+                else:
+                    _full_lower_cache = "\n\n".join(
+                        (d.get("text") or "") for d in applicable_docs
+                    ).lower()
+            return _full_lower_cache
+
         problems: list[str] = []
 
         # 1) 禁止关键词命中 → fail
@@ -2469,8 +3256,11 @@ def _apply_structured_rules(
                 problems.append(f"命中禁止性关键词「{kw}」：…{ctx}…")
 
         # 2) 必含要素缺失 → fail
+        #    「缺失」是对全文的否定断言，必须基于未截断全文判定，否则截断尾段的要素
+        #    会被误报缺失并锁死错误结论。故先查截断文本，未命中再回查未截断全文。
         for elem in st.get("require_elements", []) or []:
-            if str(elem).strip() and str(elem).strip().lower() not in text_lower:
+            e = str(elem).strip().lower()
+            if e and e not in text_lower and e not in _full_text_lower():
                 problems.append(f"缺失必含要素「{elem}」")
 
         # 3) 正则模式
@@ -2497,8 +3287,9 @@ def _apply_structured_rules(
             # 单位感知抽取：兼容 万/千/亿（如「投标保证金：100万元」→ 1,000,000 元），
             # 与法规结构化提示（max 一律换算为元）保持同一量纲，避免「100万 > 80万上限」
             # 因裸数字 100 < 800000 而漏判。字段未出现或抽不出数字 → 跳过（回落 LLM）。
-            val = _extract_amount_near(rule_text, field)
-            if val is not None:
+            val, ambiguous = _extract_amount_near_ex(rule_text, field)
+            # 抽取歧义（字段多处出现 / 窗口内多个不同金额）→ 不锁定，回落 LLM 判定
+            if val is not None and not ambiguous:
                 try:
                     if val > float(cap):
                         problems.append(
@@ -2525,10 +3316,11 @@ def _apply_structured_rules(
             ratio_base = str(pd.get("ratio_base", "a") or "a").strip().lower()
             if ratio_base not in ("a", "b"):
                 ratio_base = "a"
-            va = _extract_amount_near(rule_text, a_fields)
-            vb = _extract_amount_near(rule_text, b_fields)
-            if va is None or vb is None:
-                # 任一金额抽取失败 → 无法判定，标记缺失（不伪造 pass，回落 LLM）
+            va, amb_a = _extract_amount_near_ex(rule_text, a_fields)
+            vb, amb_b = _extract_amount_near_ex(rule_text, b_fields)
+            if va is None or vb is None or amb_a or amb_b:
+                # 任一金额抽取失败或存在歧义（字段多处出现/多个不同金额）→ 无法确定唯一取值，
+                # 标记缺失（不伪造 pass、也不锁定 fail，回落 LLM 判定）
                 pair_missing = True
                 continue
             diff = abs(va - vb)
@@ -2773,6 +3565,7 @@ async def _run_rule_per_file(
                 timeout=timeout,
                 temperature=temperature,
                 kb_state=kb_state,
+                mode=mode,
             )
 
     results = await asyncio.gather(*[run_one(d) for d in docs], return_exceptions=True)
@@ -2859,7 +3652,7 @@ async def _proofread_by_segments(
                 f"{seg_prompt}\n\n# 法规依据（来自知识库预检索，供本批次核查参考）\n"
                 f"{batch_kb_context}"
             )
-        return await _run_with_kb(seg_prompt, **run_kwargs)
+        return await _run_with_kb(seg_prompt, **{"mode": mode, **run_kwargs})
 
     results = await asyncio.gather(
         *[run_seg(i, s) for i, s in enumerate(segs, 1)], return_exceptions=True
@@ -3126,6 +3919,12 @@ async def run_review(
                             str(r.get("id")) for r in batch if r.get("id")
                         ),
                     )
+                    # 批次显示名：下方「跨文件缺件前置校验」会把被拦截的规则移出 batch，
+                    # 单规则批次被摘掉后 batch 会变成空列表，若此时再拼名字就会得到空串，
+                    # 进度日志显示为光秃秃的「审核规则 」。故在任何过滤之前先取好显示名。
+                    batch_names = ", ".join(
+                        str(r.get("name") or r.get("id") or "未命名规则") for r in batch
+                    )
                     # 拆分：已被确定性引擎锁定的规则移出 LLM 批次（避免随机覆盖），
                     # 其结论直接计入本批次最终 findings；其余走 LLM 辅助判定。
                     llm_rules, locked_findings = _merge_structured_into_batch(
@@ -3159,8 +3958,11 @@ async def run_review(
                     # （不产生结论，避免误报 unknown/失败）。
                     batch_docs = _applicable_docs(batch, docs)
                     if not batch_docs:
-                        names = ", ".join(
-                            str(r.get("name") or r.get("id")) for r in batch
+                        names = (
+                            ", ".join(
+                                str(r.get("name") or r.get("id")) for r in batch
+                            )
+                            or batch_names
                         )
                         await emit(
                             {
@@ -3178,8 +3980,11 @@ async def run_review(
                             batch_docs, section_ids
                         )
                         if not scoped_docs:
-                            names = ", ".join(
-                                str(r.get("name") or r.get("id")) for r in batch
+                            names = (
+                                ", ".join(
+                                    str(r.get("name") or r.get("id")) for r in batch
+                                )
+                                or batch_names
                             )
                             await emit(
                                 {
@@ -3231,7 +4036,7 @@ async def run_review(
                             await emit(
                                 {
                                     "type": "stage", "stage": "rules",
-                                    "message": f"命中结论缓存，跳过 LLM 调用（规则 {', '.join(r['name'] for r in batch)}）",
+                                    "message": f"命中结论缓存，跳过 LLM 调用（规则 {batch_names}）",
                                     "progress": round((idx - 1) / total * 100),
                                 }
                             )
@@ -3240,7 +4045,7 @@ async def run_review(
                     await emit(
                         {
                             "type": "stage", "stage": "rules",
-                            "message": f"审核规则 {', '.join(r['name'] for r in batch)}",
+                            "message": f"审核规则 {batch_names}",
                             "progress": round((idx - 1) / total * 100),
                         }
                     )
@@ -3462,10 +4267,15 @@ async def run_review(
                                 for r in llm_rules
                             ]
                         }
+                    # 送审全文（反幻觉：核验结论依据中的数值/概念是否真实出自送审材料）
+                    _batch_corpus = _doc_corpus_from(batch_docs)
                     # 错别字校验集过滤：命中用户「不采纳」过滤规则的自动跳过（去噪）
                     try:
                         batch_findings = _normalize_findings(
-                            raw, batch, doc_names=_doc_names_from(batch_docs)
+                            raw,
+                            batch,
+                            doc_names=_doc_names_from(batch_docs),
+                            corpus=_batch_corpus,
                         )
                         batch_findings, _skipped = feedback_store.ingest_typo_findings(
                             batch_findings, task_id, user_id=user_id
@@ -3480,7 +4290,10 @@ async def run_review(
                     except Exception as exc:  # noqa: BLE001 - 过滤失败不应中断审核
                         logger.warning("错别字校验集过滤失败（已忽略）: %s", exc)
                         batch_findings = _normalize_findings(
-                            raw, batch, doc_names=_doc_names_from(batch_docs)
+                            raw,
+                            batch,
+                            doc_names=_doc_names_from(batch_docs),
+                            corpus=_batch_corpus,
                         )
                     # 确定性归一化：对单条 finding 的离散字段做归一，消除大小写/空白漂移，
                     # 使同类结论在多次审核间稳定可比（如 status 统一小写、severity 归一）。
@@ -3569,21 +4382,6 @@ async def run_review(
                 kb_traces.extend(traces)
                 findings.extend(batch_findings)
 
-            # 结构化原文定位：为每条结论附加 locations（file_id/页码/字符下标），
-            # 供前端与第三方应用直接加载原始文件并跳转到对应页与内容位置。
-            # 在 finding 事件下发前完成，保证 SSE 增量、任务落库与 done 事件
-            # 三条路径返回的结论均带定位信息（口径一致）。
-            _attach_locations(findings, docs)
-
-            for f in findings:
-                await emit({"type": "finding", "finding": f})
-
-            # 每规则一条的最终聚合结果：把分段/多文档并行产生的 N 条并行结论合并去重为
-            # 一条规则结果（20 规则 → 20 条），供前端「审核结果」按规则维度展示，
-            # 杜绝长文档拆分并行审核后同一规则散落多条结果。
-            rule_results = _aggregate_rule_results(findings, ordered_rules)
-            await emit({"type": "rule_results", "results": rule_results})
-
             # 一致性核查：统一采用「分段摘要 → 要素提取 → 一致性校验」逻辑，
             # 单文件=文档内一致性、多文件=跨文件一致性，二者走同一套处理流程。
             # 单篇文档先按段落切片，逐段用 LLM 提取关键要素与取值（重点贴合本任务
@@ -3612,9 +4410,11 @@ async def run_review(
                         if _dt:
                             _cons_types.add(str(_dt))
                 if _cons_types:
+                    # 与规则审核同一套匹配口径：显式 file_type + 按送审文件名自动匹配
+                    _cons_terms = _doc_type_terms(_cons_types)
                     consistency_docs = [
                         (i, d) for i, d in enumerate(docs)
-                        if (d.get("file_type") or None) in _cons_types
+                        if _doc_matches_types(d, _cons_types, _cons_terms)
                     ]
                 else:
                     consistency_docs = list(enumerate(docs))
@@ -3800,12 +4600,33 @@ async def run_review(
                     logger.error("一致性核查失败: %s", exc)
                     await emit({"type": "warning", "message": f"一致性核查失败: {exc}"})
 
+            # ===== 结论收口（规则维度）：定位 → 折叠 → 排序 → 下发 =====
+            # 放在一致性核查之后：一致性结论同样 append 进 findings，若在此前聚合会把
+            # 一致性结论漏出规则维度结果（历史实现正是如此）。
+            # 结构化原文定位：为每条结论附加 locations（file_id/页码/字符下标），
+            # 供前端与第三方应用直接加载原始文件并跳转到对应页与内容位置。
+            _attach_locations(findings, docs)
+
+            # 每规则仅一条结论：多文件按文件切片并行、分段校对都会让同一规则产出多条结论，
+            # 结论数膨胀为「规则数 × 文件数」。此处按规则维度折叠，各文件明细保留在
+            # file_results 供下钻，推理过程重写为简洁结构化文本。
+            # 开关 conclusion_per_rule_enabled 便于灰度/回退（关闭=维持逐条结论的旧行为）。
+            if bool(config.get("conclusion_per_rule_enabled", True)):
+                findings = _collapse_findings_per_rule(findings, ordered_rules)
+
             findings.sort(
                 key=lambda f: (
                     {"fail": 0, "warn": 1, "unknown": 2, "pass": 3}[f["status"]],
                     SEVERITY_ORDER.get(f.get("severity", "major"), 1),
                 )
             )
+            for f in findings:
+                await emit({"type": "finding", "finding": f})
+
+            # 每规则一条的最终聚合结果：供前端「规则审核结果」按规则维度展示与下钻。
+            rule_results = _aggregate_rule_results(findings, ordered_rules)
+            await emit({"type": "rule_results", "results": rule_results})
+
             # 版本清单：本次审核的完整版本指纹（引擎/规则集/数据快照/解析器/环境），
             # 随 done 事件与结果一起存证，支撑「按历史版本重跑」与一致性监控。
             version_manifest = versioning.build_version_manifest(

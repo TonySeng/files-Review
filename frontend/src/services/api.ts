@@ -571,12 +571,13 @@ export const api = {
 
   importRules(
     file: File,
-    opts: { rulesetName?: string; appendTo?: string },
+    opts: { rulesetName?: string; appendTo?: string; byFile?: boolean },
   ) {
     const form = new FormData()
     form.append('file', file)
     if (opts.rulesetName) form.append('ruleset_name', opts.rulesetName)
     if (opts.appendTo) form.append('append_to', opts.appendTo)
+    if (opts.byFile) form.append('byfile', 'true')
     return request<RuleImportResult>('/rulesets/import', {
       method: 'POST',
       body: form,

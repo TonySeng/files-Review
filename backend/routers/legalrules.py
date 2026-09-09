@@ -46,8 +46,9 @@ async def preview_split(
     modes: set[str] = set()
     files: list[dict] = []
     source_meta: list[dict] = []
+    scope = deps.scope_user_id(caller)
     for fid in req.file_ids:
-        rec = file_store.get(fid)
+        rec = file_store.get(fid, scope)
         if not rec:
             raise HTTPException(status_code=404, detail=f"文件不存在或已过期: {fid}")
         text = (rec.get("text") or "").strip()
@@ -105,6 +106,7 @@ async def generate(req: LegalRuleGenerateRequest, caller: dict = Depends(deps.ge
             user_id=caller["user_id"],
             is_shared=is_shared,
             reuse=req.reuse,
+            scope_user_id=deps.scope_user_id(caller),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

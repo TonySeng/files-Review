@@ -235,11 +235,11 @@ def _effective_group_ids(req: ReviewRequest, docs: list[dict]) -> list[str]:
     return ordered
 
 
-def _resolve_docs(req: ReviewRequest) -> list[dict]:
+def _resolve_docs(req: ReviewRequest, scope_user_id: str | None = None) -> list[dict]:
     if not req.file_ids:
         raise HTTPException(status_code=400, detail="请至少选择一个文件")
     try:
-        docs = file_store.get_many(req.file_ids)
+        docs = file_store.get_many(req.file_ids, scope_user_id)
     except file_store.StoreError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     # 内容规则校验：逐文件检查可审核文本，缺失则结构化报错（不静默丢弃）
@@ -727,7 +727,7 @@ async def _create_chained_task(
 @router.post("/stream", summary="SSE 实时审核：流式返回进度与结论事件")
 async def review_stream(req: ReviewRequest, caller: dict = Depends(deps.get_caller)):
     """启动审核，以 SSE 推送阶段进度、知识库检索轨迹与最终结论。"""
-    docs = _resolve_docs(req)
+    docs = _resolve_docs(req, deps.scope_user_id(caller))
     rules = _resolve_rules(req, docs, caller["user_id"])
 
     kb_enabled = (
@@ -780,7 +780,7 @@ async def create_task(req: ReviewRequest, caller: dict = Depends(deps.get_caller
     若引用的法规临时规则集仍在解析中，任务进入「串行等待」：先镜像解析进度，
     解析完成后自动开始审核（无需用户重新操作）。
     """
-    docs = _resolve_docs(req)  # 校验文件存在与可审核内容
+    docs = _resolve_docs(req, deps.scope_user_id(caller))  # 校验文件存在、归属与可审核内容
     user_id = caller["user_id"]
 
     # 法规规则集仍在抽取中 → 创建串行任务（先镜像解析进度，解析完自动审核）
@@ -913,12 +913,22 @@ async def get_task(task_id: str, caller: dict = Depends(deps.get_caller)):
     return to_detail(task)
 
 
+def _assert_task_access(task: dict, caller: dict) -> None:
+    """任务归属校验：管理员可操作全部；普通用户仅能操作自己归属的任务。
+
+    为避免枚举探测，无权访问统一以 404 返回（与 get_task 行为一致）。
+    """
+    if caller.get("role") != "admin" and task.get("user_id") not in (None, caller.get("user_id")):
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+
 @router.post("/tasks/{task_id}/cancel", summary="取消进行中的审核任务")
-async def cancel_task(task_id: str):
-    """取消进行中/排队中的任务。"""
+async def cancel_task(task_id: str, caller: dict = Depends(deps.get_caller)):
+    """取消进行中/排队中的任务。普通用户仅能取消自己归属的任务。"""
     task = await store.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
+    _assert_task_access(task, caller)
     if task_store.TaskStore.is_terminal(task["status"]):
         return to_detail(task)
     await store.set_cancel(task_id)
@@ -932,21 +942,40 @@ async def cancel_task(task_id: str):
 
 
 @router.delete("/tasks/{task_id}", summary="删除单条审核任务")
-async def delete_task(task_id: str):
-    """从任务历史中删除一条记录。"""
+async def delete_task(task_id: str, caller: dict = Depends(deps.get_caller)):
+    """从任务历史中删除一条记录。普通用户仅能删除自己归属的任务。"""
+    task = await store.get(task_id)
+    if not task:
+        # 幂等：不存在即视为已删除，但不泄露他人任务的存在性
+        return {"deleted": True}
+    _assert_task_access(task, caller)
     await store.remove(task_id)
     return {"deleted": True}
 
 
 @router.delete("/tasks", summary="批量删除审核任务")
 async def clear_tasks(
-    confirm: bool = Query(False, description="必须显式传 confirm=true 才能清空全部任务历史，防止误触/脚本误清"),
+    confirm: bool = Query(False, description="必须显式传 confirm=true 才能清空任务历史，防止误触/脚本误清"),
+    caller: dict = Depends(deps.get_caller),
 ):
-    """清空全部任务历史。需显式 confirm=true，防止误触或脚本误调时把已完成的审核任务一并清空。"""
+    """清空任务历史。需显式 confirm=true 防止误触。
+
+    普通用户仅清空自己归属的任务；管理员清空全部。
+    """
     if not confirm:
         raise HTTPException(
             status_code=400,
-            detail="清空全部任务历史需显式携带 confirm=true 参数（如 ?confirm=true）",
+            detail="清空任务历史需显式携带 confirm=true 参数（如 ?confirm=true）",
         )
-    await store.clear()
+    scope = deps.scope_user_id(caller)
+    if scope is None:
+        # 管理员：清空全部
+        await store.clear()
+    else:
+        # 普通用户：仅清空本人任务
+        mine = await store.list(user_id=scope)
+        for t in mine:
+            tid = t.get("task_id")
+            if tid:
+                await store.remove(tid)
     return {"cleared": True}

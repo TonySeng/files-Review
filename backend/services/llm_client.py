@@ -560,31 +560,42 @@ def parse_json(text: str) -> Any:
                 logger.warning("模型输出疑似被截断，已按最小闭合修复后解析成功")
                 return val
 
-    # 5) detail 超长截断修复：findings 数组中 detail 字段疑似被截断（句子中间断开）时，
-    #    强制截短 detail 至最后一个完整句子（句号/分号前），补全 JSON 闭合后重试。
-    #    适用场景：模型在 detail 写超长导致 max_tokens 截断，前4步补齐失败时的最后抢救。
+    # 5) detail 超长截断抢救：当 JSON 解析失败且检测到 detail 字段内容超长（>120字）时，
+    #    强制截短至最后完整句，补全必要字段与闭合括号。适用场景：模型写超长 detail
+    #    触发 max_tokens 截断，导致整个 JSON 不完整、前4步容错都失败的极端场景。
     for cand in candidates:
-        # 寻找 "detail": "..." 疑似被截断的位置（引号未闭合或句子不完整）
-        detail_pattern = r'"detail"\s*:\s*"([^"]{100,}?)(?=$|[^"\\]$)'
-        match = re.search(detail_pattern, cand, re.DOTALL)
-        if match:
-            detail_content = match.group(1)
-            # 查找最后一个完整句子标记（句号、分号、问号）
-            last_sentence = max(
+        # 查找所有 "detail": "..." 片段（可能有多条 finding）
+        detail_matches = list(re.finditer(r'"detail"\s*:\s*"((?:[^"\\]|\\.)*)(?:"|$)', cand, re.DOTALL))
+        if not detail_matches:
+            continue
+
+        # 检查是否有任一 detail 超长（>120字）且 JSON 整体不完整（引号/括号未闭合）
+        has_long_detail = any(len(m.group(1)) > 120 for m in detail_matches)
+        json_incomplete = cand.count('{') != cand.count('}') or cand.count('[') != cand.count(']')
+
+        if has_long_detail and json_incomplete:
+            # 对最后一个（最可能被截断的）detail 强制截短
+            last_match = detail_matches[-1]
+            detail_content = last_match.group(1)
+
+            # 查找最后一个完整句子标记
+            last_sentence_pos = max(
                 detail_content.rfind('。'),
                 detail_content.rfind('；'),
                 detail_content.rfind('？'),
                 detail_content.rfind('！'),
             )
-            if last_sentence > 50:  # 至少保留50字的有效 detail
-                truncated_detail = detail_content[:last_sentence + 1]
-                # 重建 JSON：替换被截断的 detail，补全后续字段与闭合括号
-                fixed = cand[:match.start(1)] + truncated_detail + '",'
-                # 补全必要字段与闭合（简化版：假设 detail 后还缺 title/status/evidence 等）
-                fixed += '"title":"(推理过程超长已截短)","status":"unknown","evidence":"","location":""}'
-                # 尝试补全为 findings 数组与外层对象
-                if '"findings"' in cand and fixed.count('{') > fixed.count('}'):
+
+            if last_sentence_pos > 40:  # 至少保留40字
+                truncated = detail_content[:last_sentence_pos + 1]
+                # 重建：替换被截断的 detail，补全后续必要字段
+                before = cand[:last_match.start(1)]
+                fixed = before + truncated + '","title":"(推理过程超长已截短)","status":"unknown","evidence":"","location":"","suggestion":""}'
+
+                # 补全 findings 数组闭合与外层对象闭合
+                if '"findings"' in fixed:
                     fixed += ']}'
+
                 ok, val = _try(fixed)
                 if ok:
                     logger.warning("检测到 detail 字段超长截断，已强制截短至最后完整句并补全 JSON")

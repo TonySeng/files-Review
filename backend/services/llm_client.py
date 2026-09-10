@@ -559,6 +559,37 @@ def parse_json(text: str) -> Any:
             if ok:
                 logger.warning("模型输出疑似被截断，已按最小闭合修复后解析成功")
                 return val
+
+    # 5) detail 超长截断修复：findings 数组中 detail 字段疑似被截断（句子中间断开）时，
+    #    强制截短 detail 至最后一个完整句子（句号/分号前），补全 JSON 闭合后重试。
+    #    适用场景：模型在 detail 写超长导致 max_tokens 截断，前4步补齐失败时的最后抢救。
+    for cand in candidates:
+        # 寻找 "detail": "..." 疑似被截断的位置（引号未闭合或句子不完整）
+        detail_pattern = r'"detail"\s*:\s*"([^"]{100,}?)(?=$|[^"\\]$)'
+        match = re.search(detail_pattern, cand, re.DOTALL)
+        if match:
+            detail_content = match.group(1)
+            # 查找最后一个完整句子标记（句号、分号、问号）
+            last_sentence = max(
+                detail_content.rfind('。'),
+                detail_content.rfind('；'),
+                detail_content.rfind('？'),
+                detail_content.rfind('！'),
+            )
+            if last_sentence > 50:  # 至少保留50字的有效 detail
+                truncated_detail = detail_content[:last_sentence + 1]
+                # 重建 JSON：替换被截断的 detail，补全后续字段与闭合括号
+                fixed = cand[:match.start(1)] + truncated_detail + '",'
+                # 补全必要字段与闭合（简化版：假设 detail 后还缺 title/status/evidence 等）
+                fixed += '"title":"(推理过程超长已截短)","status":"unknown","evidence":"","location":""}'
+                # 尝试补全为 findings 数组与外层对象
+                if '"findings"' in cand and fixed.count('{') > fixed.count('}'):
+                    fixed += ']}'
+                ok, val = _try(fixed)
+                if ok:
+                    logger.warning("检测到 detail 字段超长截断，已强制截短至最后完整句并补全 JSON")
+                    return val
+
     raise LLMError(f"无法解析模型输出为 JSON: {text[:200]}")
 
 

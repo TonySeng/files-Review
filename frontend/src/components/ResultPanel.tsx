@@ -73,10 +73,10 @@ const STATUS_META: Record<
   FindingStatus,
   { label: string; color: string; icon: React.ReactNode }
 > = {
-  pass: { label: '通过', color: 'success', icon: <CheckCircleOutlined /> },
-  fail: { label: '不合规', color: 'error', icon: <CloseCircleOutlined /> },
-  warn: { label: '存疑', color: 'warning', icon: <ExclamationCircleOutlined /> },
-  unknown: { label: '待确认', color: 'default', icon: <QuestionCircleOutlined /> },
+  pass: { label: '无风险', color: 'success', icon: <CheckCircleOutlined /> },
+  fail: { label: '有风险', color: 'error', icon: <CloseCircleOutlined /> },
+  warn: { label: '待复核', color: 'warning', icon: <ExclamationCircleOutlined /> },
+  unknown: { label: '待复核', color: 'default', icon: <QuestionCircleOutlined /> },
 }
 
 const SEVERITY_META: Record<Severity, { label: string; color: string }> = {
@@ -399,8 +399,8 @@ export default function ResultPanel({
           <Typography.Text strong={row.status === 'fail'} style={{ fontSize: 13 }}>
             {title || '（无结论）'}
           </Typography.Text>
-          {/* 折叠后的推理过程含换行（【结论】/【核查范围】/【问题明细】分段），
-              必须按原文换行渲染，否则挤成一团不可读 */}
+          {/* 折叠后的审核结论为汇总文本，含换行（【结论】/【核查范围】/【问题概述】分段），
+              必须按原文换行渲染，否则挤成一团不可读；逐文件详细结论在展开下钻中查看 */}
           {row.detail && (
             <Typography.Text
               type="secondary"

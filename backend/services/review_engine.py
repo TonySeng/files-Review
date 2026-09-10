@@ -2226,6 +2226,12 @@ def _attach_locations(
 _STATUS_ORDER = {"fail": 0, "warn": 1, "unknown": 2, "pass": 3}
 _STATUS_BY_ORDER = {v: k for k, v in _STATUS_ORDER.items()}
 
+# 面向用户的风险维度显示标签（不改变内部 pass/fail/warn/unknown 语义与判定逻辑）：
+#   pass=无风险  fail=有风险  warn/unknown=待复核（存疑与未找到相关内容统一为「待复核」）
+_STATUS_RISK_LABEL = {
+    "pass": "无风险", "fail": "有风险", "warn": "待复核", "unknown": "待复核",
+}
+
 
 def _file_result_groups(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """把一条规则下的若干结论按「文件」维度归组，供前端从规则/结论下钻查看逐条明细。
@@ -2285,70 +2291,82 @@ def _rule_conclusion_detail(
     max_files: int = 8,
     max_items: int = 5,
 ) -> str:
-    """生成「每规则一条」结论的推理过程：简洁、结构化、可追溯。
+    """生成「每规则一条」结论的**汇总**文本：概述结论，不逐条罗列各文件明细。
 
-    结构固定为三段，便于快速阅读与事后追溯：
-      【结论】整体判定 + 涉及文件数 + 问题数
-      【核查范围】本规则实际审核的文件清单（来自规则关联文档类型的自动匹配结果）
-      【问题明细】按文件归组的逐条问题（依据 + 定位），超量截断并提示看下钻
+    汇总口径（只汇总明确有问题的结论）：
+      - 仅 fail（明确不合规）会被按问题类型（去重标题）汇总进【问题概述】；
+      - warn（存疑）与 unknown（待确认 / 未找到相关内容）**不进汇总正文**，
+        仅在结论行以计数提示"另有 N 项需人工复核/待确认"，避免把不确定信息
+        当成确定问题堆进结论；
+      - 各文件逐条详细结论（含 warn/unknown）完整保留在 file_results，前端展开下钻查看。
+
+    max_items 仅用于概述截断，防止极端场景下汇总文本过长。
     """
-    status_label = {
-        "fail": "不合规", "warn": "存疑", "unknown": "待确认", "pass": "通过",
-    }.get(status, status)
-    total_issues = sum(int(g.get("issue_count") or 0) for g in file_groups)
+    # 面向用户的风险维度标签：pass=无风险 fail=有风险 warn/unknown=待复核
+    status_label = _STATUS_RISK_LABEL.get(status, status)
     files = [str(g.get("file") or "") for g in file_groups]
     files = [f for f in files if f and f != "（未关联文件）"] or [
         str(g.get("file") or "") for g in file_groups
     ]
+    scope = "、".join(files) if files else "（未关联到具体文件）"
 
-    if status == "pass" or total_issues == 0:
-        scope = "、".join(files) if files else "（未关联到具体文件）"
+    # 分类统计：fail=有风险（按标题跨文件去重汇总）；warn/unknown 统一为「待复核」仅计数不汇总
+    fail_title_files: dict[str, set[str]] = {}
+    fail_title_order: list[str] = []
+    review_count = 0  # 待复核项数（存疑 + 未找到相关内容）
+    for g in file_groups:
+        gname = str(g.get("file") or "（未关联文件）")
+        for it in g.get("findings") or []:
+            st = str(it.get("status") or "pass")
+            if st == "fail":
+                title = str(it.get("title") or "").strip() or "（未命名问题）"
+                if title not in fail_title_files:
+                    fail_title_files[title] = set()
+                    fail_title_order.append(title)
+                fail_title_files[title].add(gname)
+            elif st in ("warn", "unknown"):
+                review_count += 1
+
+    # 无风险（全部通过）
+    if status == "pass":
         return (
-            f"【结论】{status_label} · 已核查 {len(file_groups)} 个文件，未发现问题\n"
+            f"【结论】{status_label} · 已核查 {len(file_groups)} 个文件，未发现风险\n"
             f"【核查范围】{scope}"
         )
 
-    scope = "、".join(files) if files else "（未关联到具体文件）"
+    # 无明确风险（只有待复核项）：不汇总，仅提示需人工复核
+    if not fail_title_order:
+        note = f"{review_count} 项待复核" if review_count else "无明确风险"
+        return (
+            f"【结论】{status_label} · 已核查 {len(file_groups)} 个文件 · 无明确风险\n"
+            f"【核查范围】{scope}\n"
+            f"（{note}，需人工复核；展开查看各文件明细）"
+        )
+
+    # 有风险：仅汇总 fail 类问题
+    fail_total = sum(len(fs) for fs in fail_title_files.values())
+    fail_file_count = len({f for fs in fail_title_files.values() for f in fs})
     lines: list[str] = [
-        f"【结论】{status_label} · 涉及 {len(file_groups)} 个文件 · 共 {total_issues} 项问题",
+        f"【结论】{status_label} · {fail_file_count}/{len(file_groups)} 个文件存在风险 · 共 {fail_total} 项",
         f"【核查范围】{scope}",
-        "【问题明细】",
+        "【风险概述】",
     ]
-    shown_files = 0
-    hidden_files = 0
-    for g in file_groups:
-        if shown_files >= max_files:
-            hidden_files += 1
-            continue
-        gname = str(g.get("file") or "（未关联文件）")
-        gstatus = {
-            "fail": "不合规", "warn": "存疑", "unknown": "待确认", "pass": "通过",
-        }.get(str(g.get("status") or "pass"), "通过")
-        g_items = [it for it in (g.get("findings") or []) if str(it.get("status") or "pass") != "pass"]
-        g_all = g.get("findings") or []
-        if not g_items:
-            g_items = g_all
-        lines.append(f"{shown_files + 1}. 【{gname}】{gstatus}（{len(g_items)} 项）")
-        shown_items = 0
-        hidden_items = 0
-        for it in g_items:
-            if shown_items >= max_items:
-                hidden_items += 1
-                continue
-            title = str(it.get("title") or "").strip() or "（未命名问题）"
-            lines.append(f"   ① {title}")
-            ev = str(it.get("evidence") or "").strip()
-            if ev:
-                lines.append(f"      依据：{ev[:120]}{'…' if len(ev) > 120 else ''}")
-            loc = str(it.get("location") or "").strip()
-            if loc:
-                lines.append(f"      定位：{loc[:80]}{'…' if len(loc) > 80 else ''}")
-            shown_items += 1
-        if hidden_items:
-            lines.append(f"   ……该文件另有 {hidden_items} 项，见下钻明细")
-        shown_files += 1
-    if hidden_files:
-        lines.append(f"……另有 {hidden_files} 个文件的问题，见下钻明细")
+    for title in fail_title_order[:max_items]:
+        fs = fail_title_files[title]
+        # 多文件命中标注涉及文件数，单文件命中直接给出文件名，概述保持紧凑
+        if len(fs) > 1:
+            lines.append(f"· {title}（{len(fs)} 个文件）")
+        else:
+            only = next(iter(fs))
+            lines.append(f"· {title}（{only}）")
+    hidden_titles = len(fail_title_order) - min(len(fail_title_order), max_items)
+    if hidden_titles > 0:
+        lines.append(f"· 另有 {hidden_titles} 类风险，展开查看各文件明细")
+
+    # 待复核项只提示计数，不汇总进正文
+    if review_count:
+        lines.append(f"（另有 {review_count} 项待复核，未计入上述风险，需人工复核）")
+    lines.append("（展开可查看每个文件的详细结论与原文依据）")
     return "\n".join(lines)
 
 

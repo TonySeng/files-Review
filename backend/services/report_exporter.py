@@ -35,10 +35,10 @@ class ReportExporter:
     """审核报告导出器。"""
 
     STATUS_LABEL = {
-        "pass": "✓ 通过",
-        "fail": "✗ 不合规",
-        "warn": "⚠ 存疑",
-        "unknown": "? 待确认",
+        "pass": "✓ 无风险",
+        "fail": "✗ 有风险",
+        "warn": "⚠ 待复核",
+        "unknown": "? 待复核",
     }
 
     SEVERITY_LABEL = {
@@ -156,10 +156,10 @@ class ReportExporter:
                 counts[st] = counts.get(st, 0) + 1
         tbl = Table(
             [
-                [Paragraph("状态", cell_hdr), Paragraph("通过", cell_hdr), Paragraph("不合规", cell_hdr), Paragraph("存疑", cell_hdr), Paragraph("待确认", cell_hdr)],
-                [Paragraph("数量", cell), Paragraph(str(counts.get("pass", 0)), cell), Paragraph(str(counts.get("fail", 0)), cell), Paragraph(str(counts.get("warn", 0)), cell), Paragraph(str(counts.get("unknown", 0)), cell)],
+                [Paragraph("状态", cell_hdr), Paragraph("无风险", cell_hdr), Paragraph("有风险", cell_hdr), Paragraph("待复核", cell_hdr)],
+                [Paragraph("数量", cell), Paragraph(str(counts.get("pass", 0)), cell), Paragraph(str(counts.get("fail", 0)), cell), Paragraph(str(counts.get("warn", 0) + counts.get("unknown", 0)), cell)],
             ],
-            colWidths=[3 * cm, 3 * cm, 3 * cm, 3 * cm, 3 * cm],
+            colWidths=[3 * cm, 4 * cm, 4 * cm, 4 * cm],
         )
         tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1668dc")),
@@ -279,15 +279,14 @@ class ReportExporter:
 
         # 统计表格
         doc.add_paragraph()
-        table = doc.add_table(rows=1, cols=5)
+        table = doc.add_table(rows=1, cols=4)
         table.style = "Light Grid Accent 1"
 
         hdr_cells = table.rows[0].cells
         hdr_cells[0].text = "状态"
-        hdr_cells[1].text = "通过"
-        hdr_cells[2].text = "不合规"
-        hdr_cells[3].text = "存疑"
-        hdr_cells[4].text = "待确认"
+        hdr_cells[1].text = "无风险"
+        hdr_cells[2].text = "有风险"
+        hdr_cells[3].text = "待复核"
 
         # 后端 summary 用嵌套的 status_counts，缺失时回退为按 findings 现算
         counts = summary.get("status_counts") or {}
@@ -301,8 +300,8 @@ class ReportExporter:
         row_cells[0].text = "数量"
         row_cells[1].text = str(counts.get("pass", 0))
         row_cells[2].text = str(counts.get("fail", 0))
-        row_cells[3].text = str(counts.get("warn", 0))
-        row_cells[4].text = str(counts.get("unknown", 0))
+        # 存疑 + 待确认统一为「待复核」
+        row_cells[3].text = str(counts.get("warn", 0) + counts.get("unknown", 0))
 
         # 否决项风险单独提示
         critical_items = summary.get("critical_items") or []

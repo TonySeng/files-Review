@@ -1304,6 +1304,14 @@ def _collect_typos(item: dict[str, Any], rule_id: str) -> list[dict[str, Any]]:
         wrong = (wrong or "").strip()
         correct = (correct or "").strip()
         context = (context or "").strip()
+        # OCR 空格噪声过滤：wrong 和 correct 仅空格差异时跳过（不算错别字）
+        if wrong and correct:
+            wrong_no_space = wrong.replace(" ", "").replace("　", "")
+            correct_no_space = correct.replace(" ", "").replace("　", "")
+            if wrong_no_space == correct_no_space:
+                # 仅空格/全角空格差异，属 OCR 噪声，不计入错别字
+                logger.debug(f"过滤 OCR 空格噪声: '{wrong}' vs '{correct}'")
+                return
         if wrong and feedback_store._is_clean_typo_pair(wrong, correct):
             out.append({"wrong": wrong, "correct": correct, "context": context})
 

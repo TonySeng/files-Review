@@ -560,7 +560,7 @@ export default function ResultPanel({
               <Row gutter={12}>
                 <Col span={4}>
                   <Statistic
-                    title="不合规"
+                    title="有风险"
                     value={counts.fail}
                     valueStyle={{ color: '#ff4d4f', fontSize: 22 }}
                   />
@@ -574,21 +574,14 @@ export default function ResultPanel({
                 </Col>
                 <Col span={4}>
                   <Statistic
-                    title="存疑"
-                    value={counts.warn}
+                    title="待复核"
+                    value={counts.warn + counts.unknown}
                     valueStyle={{ color: '#faad14', fontSize: 22 }}
                   />
                 </Col>
                 <Col span={4}>
                   <Statistic
-                    title="待确认"
-                    value={counts.unknown}
-                    valueStyle={{ color: '#8c8c8c', fontSize: 22 }}
-                  />
-                </Col>
-                <Col span={4}>
-                  <Statistic
-                    title="通过"
+                    title="无风险"
                     value={counts.pass}
                     valueStyle={{ color: '#52c41a', fontSize: 22 }}
                   />
@@ -814,10 +807,9 @@ export default function ResultPanel({
                   onChange={(e) => setFilter(e.target.value)}
                   options={[
                     { value: 'all', label: `全部 ${findings.length}` },
-                    { value: 'fail', label: `不合规 ${counts.fail}` },
-                    { value: 'warn', label: `存疑 ${counts.warn}` },
-                    { value: 'unknown', label: `待确认 ${counts.unknown}` },
-                    { value: 'pass', label: `通过 ${counts.pass}` },
+                    { value: 'fail', label: `有风险 ${counts.fail}` },
+                    { value: 'warn', label: `待复核 ${counts.warn + counts.unknown}` },
+                    { value: 'pass', label: `无风险 ${counts.pass}` },
                   ]}
                   optionType="button"
                 />
